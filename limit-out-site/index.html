@@ -1,0 +1,4501 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; manifest-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" />
+<meta name="referrer" content="no-referrer" />
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#0A1119" />
+<meta name="description" content="Limit Out — a duck hunting arcade game. Shoot ducks, send your dog, fill the bag, buy better gear." />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+
+<meta property="og:title" content="Limit Out — Duck Hunting Arcade" />
+<meta property="og:description" content="Tap ducks, send your dog, fill the bag, buy better gear." />
+<meta property="og:type" content="website" />
+
+<link rel="manifest" href="manifest.webmanifest" />
+<link rel="apple-touch-icon" href="icons/icon-180.png" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Limit Out" />
+<title>Limit Out — Duck Hunting Arcade</title>
+<style>
+  * { box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    background: #0A1119;
+  }
+
+  /* dvh follows the phone's shrinking/growing browser chrome; vh does not,
+     which is why mobile pages so often end up scrollable by a few pixels. */
+  #root {
+    min-height: 100dvh;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  body {
+    overscroll-behavior: none;      /* no pull-to-refresh mid-round */
+    -webkit-tap-highlight-color: transparent;
+    -webkit-text-size-adjust: 100%; /* stop iOS inflating text in landscape */
+    user-select: none;
+    color: #EFE3C8;
+    font-family: Georgia, 'Iowan Old Style', serif;
+  }
+
+  canvas { display: block; touch-action: none; }
+  textarea, input { user-select: text; font-size: 16px; } /* 16px stops iOS zooming on focus */
+
+  button {
+    font-family: inherit;
+    touch-action: manipulation;     /* kills the 300ms double-tap delay */
+  }
+  button:focus-visible, textarea:focus-visible, input:focus-visible {
+    outline: 2px solid #E8A33D; outline-offset: 2px;
+  }
+
+  #boot {
+    display: flex; height: 100dvh; align-items: center; justify-content: center;
+    color: #6E8496; font-family: ui-monospace, Menlo, monospace; font-size: 13px;
+  }
+
+  /* Phones: reclaim the margins the desktop layout can afford. */
+  @media (max-width: 640px) {
+    #root { padding-left: 0; padding-right: 0; }
+  }
+
+  /* Landscape phone — the good way to play. Give the canvas the height. */
+  @media (max-height: 480px) and (orientation: landscape) {
+    #root { min-height: 100dvh; }
+    canvas { max-height: 88dvh !important; }
+  }
+</style>
+</head>
+<body>
+<div id="root"><div id="boot">Loading…</div></div>
+
+<script>
+
+const STORE = {
+  async get(key) { return localStorage.getItem(key); },
+  async set(key, value) { localStorage.setItem(key, String(value)); },
+  async remove(key) { localStorage.removeItem(key); },
+};
+
+window.storage = {
+  async get(key) {
+    const value = localStorage.getItem(key);
+    if (value === null) throw new Error("No such key: " + key);
+    return { key, value };
+  },
+  async set(key, value) {
+    localStorage.setItem(key, String(value));
+    return { key, value: String(value) };
+  },
+  async delete(key) {
+    const existed = localStorage.getItem(key) !== null;
+    localStorage.removeItem(key);
+    return { key, deleted: existed };
+  },
+  async list(prefix) {
+    prefix = prefix || "";
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.indexOf(prefix) === 0) keys.push(k);
+    }
+    return { keys, prefix };
+  },
+};
+
+window.storageInfo = {
+  mode: "browser",
+  lastSource: "local",
+  label: function () { return "Saved in this browser"; },
+};
+
+</script>
+
+<script>
+/* Limit Out — game core. Generated from src/App.jsx; React wrappers stripped. */
+
+var persist = typeof persist === "function" ? persist : function () {};
+var UI = typeof UI !== "undefined" ? UI : { results() {}, wallet() {}, show() {} };
+
+
+/* ------------------------------------------------------------------
+   LIMIT OUT — Duck hunting arcade
+   Core loop: shoot -> dog retrieves -> bag fills -> cash out -> upgrade
+   The canvas runs on a mutable ref + requestAnimationFrame.
+   React state is ONLY used for UI chrome, synced at 12Hz.
+------------------------------------------------------------------ */
+
+const W = 900;
+const H = 560;
+const WATER_Y = 402;
+const KENNEL = { x: 78, y: 496 };
+// Gun pivot: bottom-centre, just below the frame. First-person framing —
+// the gun rises out of the middle of the screen rather than poking in from
+// the side. Sitting a little below the edge keeps the receiver and handguard
+// visible while the stock runs off-screen, which is how an FPS reads.
+const GUN_PIVOT = { x: 450, y: 596 };
+const GUN_MIN_ANG = -Math.PI * 0.95;
+const GUN_MAX_ANG = -Math.PI * 0.08;
+const ROUND_MS = 60000;
+const FLOAT_MS = 9500;
+/* Three species. The mallard is yours from the start; the other two appear in
+   the Outfitter once you've hunted enough rounds to be offered them, and then
+   have to be bought. Rarer birds are worth more, fly faster and give you a
+   smaller target. */
+const UNLOCK_EVERY = 5;
+
+const DUCKS = [
+  {
+    name: "Mallard",
+    value: 16,
+    unlock: 1,
+    cost: 0,        // yours from the start
+    weight: 60,
+    speedMul: 1,
+    hit: 34,       // hitbox radius
+    size: 1,
+    bob: 1,
+    yBand: [90, 300],
+    body: "#141B18",
+    head: "#1E4A34",
+    bill: "#B87A2A",
+    mark: null,
+    tail: 0,
+    note: "Steady and forgiving. Your bread and butter.",
+  },
+  {
+    name: "Teal",
+    value: 34,
+    unlock: 1 + UNLOCK_EVERY,
+    cost: 190,
+    weight: 28,
+    speedMul: 1.45,
+    hit: 26,
+    size: 0.78,
+    bob: 1.7,
+    yBand: [80, 240],
+    body: "#22262E",
+    head: "#3E5474",
+    bill: "#2A2A2A",
+    mark: "#D8CDB4",  // white facial crescent
+    tail: 0,
+    note: "Small, quick, jinks hard. Twice the money.",
+  },
+  {
+    name: "Pintail",
+    value: 58,
+    unlock: 1 + UNLOCK_EVERY * 2,
+    cost: 460,
+    weight: 12,
+    speedMul: 1.75,
+    hit: 23,
+    size: 0.9,
+    bob: 0.6,
+    yBand: [70, 170],
+    body: "#3A362C",
+    head: "#241F1B",
+    bill: "#8A8A8A",
+    mark: "#CFC4A8",  // white neck stripe
+    tail: 16,         // long trailing tail feathers
+    note: "High and fast. Worth more than three mallards.",
+  },
+  {
+    name: "Turkey",
+    value: 70,        // 20% above the pintail, the best duck at 58
+    unlock: 1,
+    cost: 0,          // comes with the ridge, not bought separately
+    weight: 100,
+    speedMul: 0.11,   // barely moves while feeding; they wait to be found
+    hit: 19,          // small target now — the ridge is meant to be hard
+    size: 1.25,
+    bob: 0.2,
+    yBand: [WATER_Y - 26, WATER_Y - 12],
+    body: "#1E1A15",
+    head: "#8A3A34",  // bare red head
+    bill: "#C9A24B",
+    mark: "#7A6034",  // bronze wing bar
+    tail: 0,
+    ground: true,     // walks until flushed
+    flushBonus: 1,    // no bonus needed — every shot is taken in the air
+    note: "Your dog puts them up. No shot at a bird on the ground.",
+    onlyAt: "ridge",
+  },
+];
+
+/* The buck. Wanders the far bank now and then, takes one shot, pays out
+   flat and needs no retrieving — a bonus, not part of the bag. */
+const BUCK = {
+  value: 100,
+  hit: 38,
+  chance: 0.28,      // per round
+  crossMs: 11000,    // how long he takes to cross
+  body: "#6B4A2E",
+  belly: "#A98A64",
+  antler: "#C9B591",
+};
+
+/* A species is offered once you reach its round, and hunts once you own it. */
+function offeredDucks(round) {
+  return DUCKS.filter((d) => round >= d.unlock);
+}
+
+function nextUnlock(round) {
+  return DUCKS.find((d) => round < d.unlock) || null;
+}
+
+function pickDuckType(round, owned, placeId) {
+  const onRidge = placeId === "ridge";
+  const pool = DUCKS.filter((d, i) => {
+    if (onRidge) return d.onlyAt === "ridge";      // the ridge is turkeys only
+    if (d.onlyAt) return false;                     // turkeys don't visit the marsh
+    return owned[i] && round >= d.unlock;
+  });
+  if (!pool.length) return 0;
+  const total = pool.reduce((a, d) => a + d.weight, 0);
+  let r = Math.random() * total;
+  for (const d of pool) {
+    r -= d.weight;
+    if (r <= 0) return DUCKS.indexOf(d);
+  }
+  return DUCKS.indexOf(pool[0]);
+}
+
+/* ------------------------------------------------------------------
+   GEAR — eight tiers per track, costs growing steeply, so maxing
+   everything is a campaign rather than a weekend.
+------------------------------------------------------------------ */
+const GUN = [
+  { shells: 2,  reload: 1200, name: "Single barrel" },
+  { shells: 3,  reload: 1050, name: "Double barrel" },
+  { shells: 4,  reload: 900,  name: "Pump action" },
+  { shells: 5,  reload: 780,  name: "Semi-auto" },
+  { shells: 6,  reload: 660,  name: "Magnum semi-auto" },
+  { shells: 8,  reload: 560,  name: "Extended tube" },
+  { shells: 10, reload: 470,  name: "Competition rig" },
+  { shells: 14, reload: 380,  name: "Custom autoloader" },
+];
+
+/* Choke — how wide the pattern throws. Wider pattern, bigger effective
+   hitbox, so shots that would have clipped past now connect. */
+const CHOKE = [
+  { bonus: 0,  name: "Full choke" },
+  { bonus: 4,  name: "Improved modified" },
+  { bonus: 8,  name: "Modified" },
+  { bonus: 12, name: "Improved cylinder" },
+  { bonus: 17, name: "Skeet" },
+  { bonus: 23, name: "Cylinder bore" },
+  { bonus: 30, name: "Spreader wad" },
+];
+
+/* Pellet count — how many birds ONE shell can down if they're inside the
+   pattern together. The payoff for holding your shot until they line up. */
+const PELLET = [
+  { birds: 1, name: "Light target load" },
+  { birds: 2, name: "Field load" },
+  { birds: 3, name: "High brass" },
+  { birds: 4, name: "Magnum load" },
+  { birds: 5, name: "Heavy steel" },
+  { birds: 7, name: "Waterfowl magnum" },
+];
+
+/* Dogs get faster AND learn to carry more per trip. */
+const DOG = [
+  { speed: 130, carry: 1, name: "Old hound" },
+  { speed: 165, carry: 1, name: "Young retriever" },
+  { speed: 200, carry: 2, name: "Trained retriever" },
+  { speed: 235, carry: 2, name: "Seasoned gun dog" },
+  { speed: 270, carry: 3, name: "Field champion" },
+  { speed: 300, carry: 3, name: "Master hunter" },
+  { speed: 335, carry: 4, name: "Grand champion" },
+  { speed: 375, carry: 5, name: "Blue ribbon" },
+  { speed: 425, carry: 7, name: "National champion" },
+  { speed: 480, carry: 10, name: "Legend of the marsh" },
+];
+
+/* Bag caps climb far higher, so a hired gun filling it alongside you still
+   leaves plenty of round for you to shoot. */
+const BAG = [
+  { cap: 6,   name: "Canvas sack" },
+  { cap: 11,  name: "Game bag" },
+  { cap: 18,  name: "Hunting pack" },
+  { cap: 28,  name: "Outfitter frame" },
+  { cap: 42,  name: "Guide's haul" },
+  { cap: 60,  name: "Freight pack" },
+  { cap: 85,  name: "Sled rig" },
+  { cap: 120, name: "Market limit" },
+  { cap: 160, name: "Punt gunner's hold" },
+  { cap: 200, name: "Whole season" },
+];
+
+/* ------------------------------------------------------------------
+   ARMORY
+   Weapons sit on top of the gun upgrade track rather than replacing it —
+   your tier still sets base shells and reload, and the weapon bends those
+   numbers. That way buying a new gun never invalidates what you've spent.
+------------------------------------------------------------------ */
+const WEAPONS = [
+  {
+    id: "pump", name: "Pump Shotgun", cost: 0, gb: 0,
+    shellMul: 1, reloadMul: 1, spreadMul: 1, pelletAdd: 0, valueMul: 1,
+    blurb: "The one you started with. Wide pattern, forgiving.",
+    art: { barrel: 330, bore: 5, form: "shotgun", stock: "wood", grip: false, forend: "wood", mag: "tube", carrier: false, shield: false, optic: "bead", brake: false },
+  },
+  {
+    id: "tactical", name: "Tactical Shotgun", cost: 0, gb: 18,
+    shellMul: 1.35, reloadMul: 0.78, spreadMul: 0.9, pelletAdd: 0, valueMul: 1,
+    blurb: "More shells, faster reload, slightly tighter pattern.",
+    art: { barrel: 285, bore: 6, form: "shotgun", stock: "folding", grip: true, forend: "rail", mag: "tube", carrier: true, shield: true, optic: "dot", brake: true },
+  },
+  {
+    id: "ar15", name: "AR-15", cost: 0, gb: 45,
+    shellMul: 1.9, reloadMul: 0.6, spreadMul: 0.45, pelletAdd: -1, valueMul: 1.15,
+    blurb: "Huge magazine, quick reload — but a rifle throws no pattern.",
+    art: { barrel: 315, bore: 4, form: "rifle", stock: "tube", grip: true, forend: "rail", mag: "box", carrier: false, shield: false, optic: "scope", brake: true },
+  },
+  {
+    id: "ak47", name: "AK-47", cost: 0, gb: 55,
+    shellMul: 1.7, reloadMul: 0.72, spreadMul: 0.55, pelletAdd: 1, valueMul: 1.1,
+    blurb: "Heavier round. Fewer shells than the AR, but hits harder.",
+    art: { barrel: 300, bore: 5.5, form: "rifle", stock: "wood", grip: true, forend: "wood", mag: "curved", carrier: false, shield: false, optic: "post", brake: false },
+  },
+  {
+    id: "pistol", name: "Pistol", cost: 0, gb: 30,
+    shellMul: 0.6, reloadMul: 0.5, spreadMul: 0.3, pelletAdd: -1, valueMul: 1.5,
+    blurb: "Tiny pattern, few rounds. Pays well because it's hard.",
+    art: { barrel: 132, bore: 4.5, form: "pistol", stock: "none", grip: true, forend: null, mag: "box", carrier: false, shield: false, optic: "bead", brake: false },
+  },
+  {
+    id: "crossbow", name: "Crossbow", cost: 0, gb: 80,
+    shellMul: 0.35, reloadMul: 2.2, spreadMul: 0.18, pelletAdd: -2, valueMul: 2.6,
+    blurb: "One bolt, slow to crank, no pattern at all. Pays like nothing else.",
+    art: { barrel: 250, bore: 4, form: "crossbow", stock: "wood", grip: true, forend: null, mag: false, carrier: false, shield: false, optic: "scope", brake: false },
+  },
+];
+
+/* Colours are pure cosmetics — they never touch a number. */
+const SKINS = [
+  { id: "blued",  name: "Blued Steel",  gb: 0,  metal: "#2A333B", lit: "#48565F", wood: "#A87A4E" },
+  { id: "black",  name: "Matte Black",  gb: 4,  metal: "#1A1D20", lit: "#33383D", wood: "#2E2E30" },
+  { id: "gunmetal", name: "Gunmetal",   gb: 6,  metal: "#3E464E", lit: "#69747E", wood: "#5A5A5E" },
+  { id: "olive",  name: "Olive Drab",   gb: 8,  metal: "#3D4429", lit: "#5D6640", wood: "#6B6142" },
+  { id: "tan",    name: "Desert Tan",   gb: 10, metal: "#8A7654", lit: "#B39C74", wood: "#9C8663" },
+  { id: "camo",   name: "Marsh Camo",   gb: 14, metal: "#3A4230", lit: "#59654A", wood: "#4A4632", camo: true },
+  { id: "crimson", name: "Crimson",     gb: 18, metal: "#6E1F22", lit: "#A33A38", wood: "#4A2018" },
+  { id: "copper", name: "Copper",       gb: 24, metal: "#8A5230", lit: "#C4834E", wood: "#6B4028" },
+  { id: "silver", name: "Silver",       gb: 34, metal: "#B8C0C6", lit: "#E8EEF2", wood: "#8A9198", shine: true },
+  { id: "gold",   name: "Gold",         gb: 50, metal: "#C9A227", lit: "#F2D666", wood: "#8A6A20", shine: true },
+];
+
+/* Gold bullets: the premium currency. Earned in play as well as bought,
+   so the game is never gated behind a purchase. */
+/* Gold shells: the premium currency. Earned in play as well as bought, so
+   nothing in the game is ever locked behind a purchase. Supply is generous
+   because shells now buy guns as well as finishes. */
+const GB = {
+  perRound: 1,        // finishing any round
+  perFullBag: 3,      // filling the bag
+  perBuck: 1,         // taking a buck
+  perBest: 3,         // beating your best bag
+  moneyRate: 220,     // $ of upgrade cost one shell is worth
+};
+
+/* The flushing dog. Works the ridge ahead of you, putting turkeys in the
+   air — you can't shoot a bird on the ground, so this dog IS your rate of
+   fire. Comes with the ridge at tier 0; upgrading it is the difference
+   between a slow morning and a busy one. */
+const FLUSHER = [
+  { speed: 110, radius: 45,  rest: 2100, name: "Green pup" },
+  { speed: 145, radius: 54,  rest: 1650, name: "Started dog" },
+  { speed: 180, radius: 64,  rest: 1300, name: "Brush spaniel" },
+  { speed: 215, radius: 76,  rest: 1020, name: "Trained flusher" },
+  { speed: 255, radius: 90,  rest: 810,  name: "Upland specialist" },
+  { speed: 300, radius: 105, rest: 640,  name: "Ridge runner" },
+  { speed: 350, radius: 120, rest: 510,  name: "Champion flusher" },
+  { speed: 405, radius: 138, rest: 400,  name: "Whirlwind" },
+];
+
+/* A hired gun on the far bank. Shoots on his own, misses plenty at first,
+   and everything he drops still needs a dog to fetch it. */
+const HUNTER2 = [
+  { every: 3400, acc: 0.50, name: "Green kid" },
+  { every: 2900, acc: 0.60, name: "Weekend hunter" },
+  { every: 2400, acc: 0.69, name: "Steady shot" },
+  { every: 2000, acc: 0.77, name: "Old timer" },
+  { every: 1650, acc: 0.84, name: "Market gunner" },
+  { every: 1350, acc: 0.90, name: "Crack shot" },
+  { every: 1100, acc: 0.95, name: "Dead eye" },
+];
+
+/* ------------------------------------------------------------------
+   PLACES — different backdrop, palette and modifiers. Later places pay
+   better because the birds are faster and the water takes them sooner.
+------------------------------------------------------------------ */
+const PLACES = [
+  {
+    id: "bayou", name: "Cypress Bayou", cost: 0,
+    valueMul: 1, speedMul: 1, floatMul: 1,
+    note: "Warm dawn, still backwater, cypress standing in the shallows.",
+    sky: ["#141F2E", "#2C4256", "#8A6E4E", "#B08A5C"],
+    water: ["#43554F", "#2E4046", "#243239"],
+    sun: "#E8A33D", sunR: 46, sunX: 690, sunY: 336, accent: "#E8A33D",
+  },
+  {
+    id: "prairie", name: "Prairie Pothole", cost: 1400,
+    valueMul: 1.35, speedMul: 1.2, floatMul: 0.85,
+    note: "Open sky, no cover, hard wind. Birds come in fast and high.",
+    sky: ["#1B2740", "#3A5578", "#9C8A6E", "#D6B98A"],
+    water: ["#4E6270", "#354A58", "#26363F"],
+    sun: "#F2C46A", sunR: 34, sunX: 240, sunY: 352, accent: "#F2C46A",
+  },
+  {
+    id: "tundra", name: "Frozen Flats", cost: 5200,
+    valueMul: 1.9, speedMul: 1.45, floatMul: 0.6,
+    note: "Snow, black ice and a low grey sun. Birds go under fast in the cold.",
+    sky: ["#243040", "#4A5C72", "#8FA3B8", "#C8D6E2"],
+    water: ["#8CA3B4", "#6E8496", "#54697C"],
+    sun: "#EAF2F8", sunR: 28, sunX: 620, sunY: 360, accent: "#9FC4E0",
+  },
+  {
+    id: "ridge", name: "Hardwood Ridge", cost: 10000,
+    valueMul: 1, speedMul: 1, floatMul: 1.6,
+    turkey: true,
+    // A ridge holds a handful of birds, not a sky full. Fewer and singly,
+    // so you can't just spam taps into a cloud of them.
+    spawnMul: 0.7,
+    flockCap: 1,
+    note: "Oak timber at first light. Turkeys on the ground — flush them, then shoot.",
+    sky: ["#1E2A22", "#3E5240", "#8A8452", "#C4B074"],
+    water: ["#4A4230", "#3A3426", "#2A261C"],  // leaf litter, not water
+    sun: "#F0D98A", sunR: 30, sunX: 300, sunY: 344, accent: "#C9A24B",
+  },
+];
+
+const COST = {
+  gun:     [0, 60, 145, 330, 720, 1500, 3100, 6400],
+  choke:   [0, 90, 210, 460, 980, 2000, 4100],
+  pellet:  [0, 140, 330, 720, 1550, 3200],
+  dog:     [0, 55, 135, 310, 680, 1420, 2950, 6100, 12500, 24000],
+  bag:     [0, 50, 120, 280, 610, 1300, 2700, 5600, 11000, 21000],
+  dog2:    [0, 70, 160, 360, 780, 1620, 3350, 6900, 14000, 27000],
+  hunter2: [0, 240, 520, 1100, 2300, 4700, 9500],
+  flusher: [0, 80, 190, 420, 900, 1850, 3800, 7800],
+};
+
+const HIRE_HUNTER = 900;
+const HIRE_DOG = 650;
+
+/* The gear rows the Outfitter renders, in order. */
+const TRACKS = [
+  { key: "gun",    table: GUN,    title: "Shotgun",   detail: (l) => `${GUN[l].shells} shells · ${(GUN[l].reload / 1000).toFixed(2)}s reload` },
+  { key: "choke",  table: CHOKE,  title: "Choke",     detail: (l) => (CHOKE[l].bonus ? `+${CHOKE[l].bonus} pattern width` : "tight pattern, no forgiveness") },
+  { key: "pellet", table: PELLET, title: "Shot load", detail: (l) => `${PELLET[l].birds} bird${PELLET[l].birds > 1 ? "s" : ""} per shell` },
+  { key: "dog",    table: DOG,    title: "Retriever", detail: (l) => `${DOG[l].speed} speed · carries ${DOG[l].carry}` },
+  { key: "bag",    table: BAG,    title: "Game bag",  detail: (l) => `holds ${BAG[l].cap}` },
+];
+
+const BLANK_LVL = { gun: 0, choke: 0, pellet: 0, dog: 0, bag: 0, dog2: 0, hunter2: 0, flusher: 0 };
+
+const C = {
+  duskA: "#141F2E",
+  duskB: "#2C4256",
+  amber: "#E8A33D",
+  amberDim: "#B87A2A",
+  reed: "#0C1219",
+  water: "#22384A",
+  waterLit: "#3E5E71",
+  paper: "#EFE3C8",
+  rust: "#A85433",
+  fog: "#6E8496",
+  sedgeFar: "#3B4433",
+  sedgeMid: "#4E5A3A",
+  sedgeNear: "#2A3324",
+  mud: "#3A3A2E",
+  cattail: "#5A4326",
+  cypressFar: "#3E4C52",
+  cypressMid: "#25322F",
+  cypressNear: "#151F1D",
+  moss: "#7C8A78",
+};
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+function newGame() {
+  return {
+    t: 0,
+    round: 1,
+    money: 0,
+    hunter: "",
+    dogName: "",
+    best: 0,
+    ducks: [true, false, false, true], // mallard from the start; turkey comes with the ridge
+    place: 0,
+    places: [true, false, false, false],
+    hired: { dog2: false, hunter2: false },
+    gb: 0,                       // gold shells
+    weapon: "pump",
+    skin: "blued",
+    weapons: ["pump"],
+    skins: ["blued"],
+    dog2Name: "",
+    hunter2Name: "",
+    lvl: { ...BLANK_LVL },
+  };
+}
+
+/* ------------------------------------------------------------------
+   SAVE ADAPTER
+   One swappable object. Everything the game does with persistence goes
+   through here, so the storage backend can be replaced without touching
+   game code.
+
+   Web (now):     window.storage
+   Native later:  Capacitor Preferences
+   Game Center:   fill in submitScore / syncCloud below
+------------------------------------------------------------------ */
+const SAVE_KEY = "limitout:save:v1";
+const PROBE_KEY = "limitout:probe";
+
+const Save = {
+  mem: null,          // fallback copy, survives screen changes but not a reload
+  backend: "unknown", // "device" | "session"
+
+  // Find out once whether a real storage backend exists.
+  async probe() {
+    try {
+      await window.storage.set(PROBE_KEY, "1");
+      await window.storage.get(PROBE_KEY);
+      this.backend = "device";
+    } catch {
+      this.backend = "session";
+    }
+    return this.backend;
+  },
+
+  async load() {
+    try {
+      const r = await window.storage.get(SAVE_KEY);
+      // localStorage is editable by anyone with devtools, so a stored save
+      // gets the same validation as one pasted in from a code.
+      const parsed = r ? this.sanitize(JSON.parse(r.value)) : null;
+      if (parsed) this.mem = parsed;
+      return parsed ?? this.mem;
+    } catch {
+      return this.mem; // missing key or no backend — fall back to memory
+    }
+  },
+
+  async write(meta) {
+    const data = {
+      v: 1,
+      hunter: meta.hunter,
+      dogName: meta.dogName,
+      money: meta.money,
+      round: meta.round,
+      best: meta.best,
+      ducks: [...(meta.ducks || DUCKS.map((_, i) => i === 0))],
+      places: [...(meta.places || PLACES.map((_, i) => i === 0))],
+      place: meta.place ?? 0,
+      hired: { ...(meta.hired || { dog2: false, hunter2: false }) },
+      gb: meta.gb || 0,
+      weapon: meta.weapon || "pump",
+      skin: meta.skin || "blued",
+      weapons: [...(meta.weapons || ["pump"])],
+      skins: [...(meta.skins || ["blued"])],
+      dog2Name: meta.dog2Name || "",
+      hunter2Name: meta.hunter2Name || "",
+      lvl: { ...meta.lvl },
+      saved: Date.now(),
+    };
+    this.mem = data;
+    try {
+      await window.storage.set(SAVE_KEY, JSON.stringify(data));
+      this.backend = "device";
+      return true;
+    } catch {
+      this.backend = "session";
+      return false; // in-memory only; still playable this session
+    }
+  },
+
+  async clear() {
+    this.mem = null;
+    try {
+      await window.storage.delete(SAVE_KEY);
+    } catch {
+      /* nothing to clear */
+    }
+  },
+
+  /* --- transfer codes ---------------------------------------------
+     Each place the game runs (this page, a downloaded file, a Chrome
+     extension) has its own separate storage. A code is the only way to
+     carry a save across them. */
+  encode(meta) {
+    const data = {
+      v: 1, hunter: meta.hunter, dogName: meta.dogName,
+      money: meta.money, round: meta.round, best: meta.best,
+      ducks: meta.ducks, places: meta.places, place: meta.place,
+      hired: meta.hired, lvl: meta.lvl,
+      gb: meta.gb, weapon: meta.weapon, skin: meta.skin,
+      weapons: meta.weapons, skins: meta.skins,
+    };
+    return btoa(unescape(encodeURIComponent(JSON.stringify(data))));
+  },
+
+  /* A save code is UNTRUSTED INPUT. It can arrive from anywhere — a friend,
+     a forum, a corrupted clipboard. Every field is clamped to a legal value
+     before it reaches the game, because an out-of-range level like
+     lvl.gun = 9999 makes GUN[9999] undefined and crashes on the next frame.
+     JSON.parse is used rather than eval, so a code can never execute code;
+     the risk here is bad DATA, not injected script. */
+  sanitize(d) {
+    if (!d || typeof d !== "object") return null;
+
+    const int = (v, lo, hi, dflt) => {
+      const n = Math.floor(Number(v));
+      return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : dflt;
+    };
+    const str = (v, dflt, max) =>
+      typeof v === "string" && v.trim() ? v.trim().slice(0, max) : dflt;
+    const boolArr = (v, len, dflt) =>
+      Array.from({ length: len }, (_, i) => (Array.isArray(v) ? !!v[i] : dflt(i)));
+
+    const lvl = {};
+    for (const key of Object.keys(BLANK_LVL)) {
+      const max = (COST[key] ? COST[key].length : 1) - 1;
+      lvl[key] = int(d.lvl && d.lvl[key], 0, max, 0);
+    }
+
+    // only ids that actually exist survive
+    const weapons = Array.isArray(d.weapons)
+      ? WEAPONS.filter((w) => d.weapons.includes(w.id)).map((w) => w.id)
+      : [];
+    if (!weapons.includes("pump")) weapons.unshift("pump");
+    const skins = Array.isArray(d.skins)
+      ? SKINS.filter((k) => d.skins.includes(k.id)).map((k) => k.id)
+      : [];
+    if (!skins.includes("blued")) skins.unshift("blued");
+
+    const weapon = weapons.includes(d.weapon) ? d.weapon : "pump";
+    const skin = skins.includes(d.skin) ? d.skin : "blued";
+
+    const places = boolArr(d.places, PLACES.length, (i) => i === 0);
+    places[0] = true;                                  // home is never lost
+    let place = int(d.place, 0, PLACES.length - 1, 0);
+    if (!places[place]) place = 0;                     // can't be somewhere you don't own
+
+    return {
+      hunter: str(d.hunter, "Hunter", 16),
+      dogName: str(d.dogName, "Scout", 16),
+      money: int(d.money, 0, 1e9, 0),
+      round: int(d.round, 1, 100000, 1),
+      best: int(d.best, 0, 100000, 0),
+      gb: int(d.gb, 0, 1e6, 0),
+      ducks: DUCKS.map((dk, i) =>
+        dk.onlyAt ? true : i === 0 ? true : Array.isArray(d.ducks) ? !!d.ducks[i] : false
+      ),
+      places,
+      place,
+      hired: {
+        dog2: !!(d.hired && d.hired.dog2),
+        hunter2: !!(d.hired && d.hired.hunter2),
+      },
+      weapon,
+      skin,
+      weapons,
+      skins,
+      lvl,
+    };
+  },
+
+  decode(code) {
+    try {
+      if (typeof code !== "string" || code.length > 8000) return null;
+      const d = JSON.parse(decodeURIComponent(escape(atob(code.trim()))));
+      return this.sanitize(d);
+    } catch {
+      return null;
+    }
+  },
+
+  /* --- seams for the native build ---------------------------------
+     submitScore(n): Game Center leaderboard (iOS) / Play Games (Android).
+     No-op on web. Wire up in the Capacitor wrapper, not here. */
+  async submitScore(/* best */) {
+    return false;
+  },
+  async syncCloud() {
+    return false;
+  },
+};
+
+function makeDog(x) {
+  return { x, y: KENNEL.y, state: "idle", targets: [], carried: [], gait: 0 };
+}
+
+function newRound(meta) {
+  return {
+    time: ROUND_MS,
+    ducks: [],
+    floats: [],
+    parts: [],
+    flash: null,
+    dry: null,
+    gun: { ang: -Math.PI / 2, recoil: 0, dip: 0, muzzle: 0 },
+    aim: null,
+    refill: 0,
+    shake: 0,
+    place: meta.place ?? 0,
+    dogs: (() => {
+      const arr = [makeDog(KENNEL.x)];
+      if (meta.hired?.dog2) arr.push(makeDog(KENNEL.x + 58));
+      return arr;
+    })(),
+    h2: meta.hired?.hunter2
+      ? { x: 205, y: WATER_Y + 30, ang: -Math.PI / 2, nextShot: 1800, recoil: 0, muzzle: 0 }
+      : null,
+    shells: shellsFor(meta),
+    reloadUntil: 0,
+    bagged: 0,
+    takeValue: 0,
+    byType: {},
+    multi: null,
+    // the flushing dog, working the ridge ahead of you
+    flusher: (PLACES[meta.place ?? 0].turkey)
+      ? { x: W * 0.5, y: WATER_Y + 16, state: "hunt", restLeft: 0, gait: 0, dir: 1, puff: 0 }
+      : null,
+    // one buck a round at most, and only sometimes
+    buck: Math.random() < BUCK.chance
+      ? {
+          x: Math.random() < 0.5 ? -60 : W + 60,
+          y: WATER_Y - 30,
+          dir: 0,
+          appearIn: 6000 + Math.random() * 34000,
+          alive: true,
+          out: false,
+          gait: 0,
+          alertUntil: 0,
+        }
+      : null,
+    buckTaken: 0,
+    lost: 0,
+    missed: 0,
+    spawnIn: 700,
+    over: false,
+    paused: false,
+    frames: 0,
+    nextId: 1,
+  };
+}
+
+/* Put a ground bird in the air: it breaks upward and away, and becomes
+   worth its flush bonus. This is the moment the turkey hunt turns into
+   the shooting game the rest of Limit Out already is. */
+function flushBird(s, d) {
+  if (!d.onGround) return;
+  d.onGround = false;
+  d.flushed = true;
+  const T = DUCKS[d.t ?? 0];
+  // scatter: direction, speed and climb all vary, so one well-placed tap
+  // can't sweep a whole flushed group
+  d.vx = (Math.random() < 0.5 ? -1 : 1) * (185 + Math.random() * 150);
+  d.climb = 240 + Math.random() * 130;       // px/sec upward, decaying
+  d.bobAmp = 10;
+  Sound.flush();
+  for (let i = 0; i < 12; i++) {
+    s.parts.push({
+      x: d.x, y: d.y,
+      vx: (Math.random() - 0.5) * 70,
+      vy: -Math.random() * 80,
+      life: 700 + Math.random() * 500, max: 1200,
+      kind: "feather", rot: Math.random() * 6,
+    });
+  }
+}
+
+/* Reload on the wall clock, not on accumulated loop time.
+   Safe to call from anywhere, any number of times per frame. */
+function tryReload(s, m) {
+  if (s.shells > 0) return;
+  const now = performance.now();
+  if (!Number.isFinite(s.reloadUntil) || s.reloadUntil <= 0) {
+    s.reloadUntil = now + reloadFor(m);
+    return;
+  }
+  if (now >= s.reloadUntil) {
+    s.shells = shellsFor(m);
+    s.refill = 320;
+    s.reloadUntil = 0;
+    Sound.pump();
+  }
+}
+
+/* Bald cypress silhouette: flared buttress base, tapering trunk,
+   flattened irregular crown, optional hanging moss. Deterministic per seed. */
+function drawCypress(ctx, x, baseY, h, w, col, alpha, t, seed, moss) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = col;
+  const sway = Math.sin(t / 2400 + seed) * (h * 0.008);
+  const topY = baseY - h;
+
+  // buttressed base — the wide flare is what reads as cypress
+  ctx.beginPath();
+  ctx.moveTo(x - w * 2.1, baseY);
+  ctx.quadraticCurveTo(x - w * 0.8, baseY - h * 0.1, x - w * 0.44, baseY - h * 0.26);
+  ctx.lineTo(x + w * 0.44, baseY - h * 0.26);
+  ctx.quadraticCurveTo(x + w * 0.8, baseY - h * 0.1, x + w * 2.1, baseY);
+  ctx.closePath();
+  ctx.fill();
+
+  // trunk
+  ctx.beginPath();
+  ctx.moveTo(x - w * 0.44, baseY - h * 0.24);
+  ctx.quadraticCurveTo(x - w * 0.22 + sway * 0.5, baseY - h * 0.6, x - w * 0.13 + sway, topY);
+  ctx.lineTo(x + w * 0.13 + sway, topY);
+  ctx.quadraticCurveTo(x + w * 0.22 + sway * 0.5, baseY - h * 0.6, x + w * 0.44, baseY - h * 0.24);
+  ctx.closePath();
+  ctx.fill();
+
+  // branches, alternating, longest at the bottom of the crown
+  ctx.strokeStyle = col;
+  for (let b = 0; b < 5; b++) {
+    const by = topY + h * 0.055 * b + h * 0.02;
+    const dir = (b + seed) % 2 === 0 ? 1 : -1;
+    const len = w * (3.6 - b * 0.5) * (1 + ((seed * 7 + b) % 3) * 0.07);
+    ctx.lineWidth = Math.max(1, w * 0.26 - b * 0.03 * w);
+    ctx.beginPath();
+    ctx.moveTo(x + sway, by + h * 0.02);
+    ctx.quadraticCurveTo(x + sway + dir * len * 0.5, by - h * 0.025, x + sway + dir * len, by);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.ellipse(x + sway + dir * len * 0.68, by - h * 0.012, len * 0.44, h * 0.032, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // flattened crown
+  ctx.beginPath();
+  ctx.ellipse(x + sway, topY + h * 0.035, w * 2.3, h * 0.055, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Spanish moss draping off the lower branches
+  if (moss) {
+    ctx.strokeStyle = C.moss;
+    ctx.globalAlpha = alpha * 0.32;
+    ctx.lineWidth = Math.max(1, w * 0.14);
+    for (let m = 0; m < 7; m++) {
+      const dir = m % 2 === 0 ? 1 : -1;
+      const mx = x + sway + dir * w * (1.1 + (m % 4) * 0.7);
+      const my = topY + h * (0.09 + (m % 3) * 0.05);
+      const drop = h * (0.07 + ((m * 5) % 4) * 0.03);
+      const drift = Math.sin(t / 1600 + m + seed) * 2;
+      ctx.beginPath();
+      ctx.moveTo(mx, my);
+      ctx.quadraticCurveTo(mx + drift, my + drop * 0.6, mx + drift * 1.6, my + drop);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+/* Depth bands, front to back. Front trees are SHORT and dark, back trees
+   are TALL and hazy — which also keeps the duck flight band clear up front. */
+const BANDS = [
+  // back
+  { n: 20, y: -8,  h: 200, hv: 130, w: 2.6, wv: 2, col: "cypressFar",  a: 0.34, moss: false, step: 46,  off: 0 },
+  { n: 16, y: 2,   h: 150, hv: 80,  w: 3.4, wv: 2, col: "cypressFar",  a: 0.5,  moss: false, step: 58,  off: 23 },
+  // middle
+  { n: 13, y: 22,  h: 96,  hv: 46,  w: 4.4, wv: 2, col: "cypressMid",  a: 0.72, moss: true,  step: 72,  off: 40 },
+  // front
+  { n: 11, y: 52,  h: 54,  hv: 30,  w: 5.6, wv: 2, col: "cypressNear", a: 0.95, moss: true,  step: 86,  off: 14 },
+];
+
+function drawBand(ctx, band, t, WATER_Y) {
+  for (let i = 0; i < band.n; i++) {
+    const seed = i * 7 + band.off;
+    const x = band.off + i * band.step + ((seed * 29) % 34) - 17;
+    const h = band.h + ((seed * 41) % band.hv);
+    const w = band.w + ((seed * 13) % 100) / 100 * band.wv;
+    const a = band.a + ((seed * 11) % 5) * 0.02;
+    drawCypress(ctx, x, WATER_Y + band.y, h, w, C[band.col], a, t, seed, band.moss);
+  }
+}
+
+/* The shotgun. Drawn along +x from the pivot, then rotated to point at the
+   aim. Recoil pushes it back along its own axis; the reload dip drops the
+   muzzle and runs the pump. */
+/* Shade a hex colour toward white (positive) or black (negative). Saves
+   hand-writing a light and dark variant for every one of the ten finishes. */
+function shade(hex, amt) {
+  const n = parseInt(hex.slice(1), 16);
+  const ch = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) =>
+    Math.max(0, Math.min(255, Math.round(amt > 0 ? v + (255 - v) * amt : v * (1 + amt))))
+  );
+  return "#" + ch.map((v) => v.toString(16).padStart(2, "0")).join("");
+}
+
+/* The gun. Drawn from a per-weapon parts list so a tactical shotgun and a
+   pump don't come out looking like the same object with a shorter barrel.
+   Draw order matters: the barrel goes down BEFORE the handguard, or the
+   barrel paints over the wood and the whole gun reads as steel. */
+function drawGun(ctx, s, reloadProgress, weapon, skin) {
+  const gun = s.gun;
+  const kick = gun.recoil;
+  const dip = gun.dip;
+  const flip = Math.cos(gun.ang) < 0 ? -1 : 1;
+  const A = weapon.art;
+
+  ctx.save();
+  ctx.translate(GUN_PIVOT.x, GUN_PIVOT.y + dip * 34);
+  ctx.rotate(gun.ang);
+  ctx.scale(1, flip);
+  ctx.rotate(kick * 0.14 + dip * 0.26);
+  ctx.translate(-kick * 20, 0);
+
+  const steel = skin.metal;
+  const steelLit = skin.lit;
+  const steelDark = shade(skin.metal, -0.35);
+  const wood = skin.wood;
+  const woodLit = shade(skin.wood, 0.28);
+  const woodDark = shade(skin.wood, -0.3);
+  const BL = A.barrel;
+  const bore = A.bore;
+
+  /* ---------- stock ---------- */
+  if (A.stock === "wood" || A.stock === "poly") {
+    ctx.fillStyle = A.stock === "wood" ? wood : steel;
+    ctx.beginPath();
+    ctx.moveTo(-40, -13);
+    ctx.quadraticCurveTo(-130, -20, -230, 6);
+    ctx.lineTo(-230, 34);
+    ctx.quadraticCurveTo(-120, 26, -40, 15);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = A.stock === "wood" ? woodLit : steelLit;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(-42, -12);
+    ctx.quadraticCurveTo(-130, -18, -228, 8);
+    ctx.stroke();
+  } else if (A.stock === "tube") {
+    // AR-style buffer tube with a slim adjustable stock
+    ctx.fillStyle = steel;
+    ctx.beginPath();
+    ctx.roundRect(-150, -8, 116, 16, 4);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.roundRect(-170, -16, 44, 34, 4);
+    ctx.fill();
+    ctx.fillStyle = steelDark;
+    ctx.fillRect(-126, -4, 74, 3);
+  } else if (A.stock === "folding") {
+    // skeletonised folding stock — two thin struts, not a slab of wood
+    ctx.strokeStyle = steel;
+    ctx.lineWidth = 7;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(-40, -6);
+    ctx.lineTo(-150, -18);
+    ctx.moveTo(-40, 10);
+    ctx.lineTo(-150, 10);
+    ctx.stroke();
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.moveTo(-150, -22);
+    ctx.lineTo(-150, 14);
+    ctx.stroke();
+    ctx.lineCap = "butt";
+  }
+
+  /* ---------- pistol grip ---------- */
+  if (A.grip) {
+    ctx.fillStyle = A.stock === "wood" ? wood : steel;
+    ctx.beginPath();
+    ctx.moveTo(-18, 8);
+    ctx.lineTo(-40, 58);
+    ctx.lineTo(-16, 64);
+    ctx.lineTo(4, 14);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = shade(A.stock === "wood" ? wood : steel, -0.4);
+    ctx.lineWidth = 1.6;
+    for (let i = 0; i < 4; i++) {
+      ctx.beginPath();
+      ctx.moveTo(-20 - i * 5, 20 + i * 10);
+      ctx.lineTo(-2 - i * 5, 26 + i * 10);
+      ctx.stroke();
+    }
+  }
+
+  /* ---------- receiver ---------- */
+  ctx.fillStyle = steel;
+  ctx.beginPath();
+  ctx.roundRect(-46, -16, 96, 32, 4);
+  ctx.fill();
+  ctx.fillStyle = steelLit;
+  ctx.fillRect(-44, -15, 92, 3);
+  ctx.fillStyle = "#0B0E11";
+  ctx.beginPath();
+  ctx.roundRect(-14, -14, 34, 11, 2);
+  ctx.fill();
+
+  ctx.strokeStyle = steel;
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.arc(-20, 24, 11, -0.2, Math.PI + 0.4);
+  ctx.stroke();
+
+  /* ---------- magazine ---------- */
+  if (A.mag === "box") {
+    ctx.fillStyle = steel;
+    ctx.beginPath();
+    ctx.roundRect(-6, 12, 22, A.form === "pistol" ? 34 : 46, 3);
+    ctx.fill();
+    ctx.fillStyle = steelDark;
+    ctx.fillRect(-2, 18, 3, A.form === "pistol" ? 22 : 32);
+  } else if (A.mag === "curved") {
+    ctx.fillStyle = steel;
+    ctx.beginPath();
+    ctx.moveTo(-6, 12);
+    ctx.quadraticCurveTo(6, 42, 24, 56);
+    ctx.lineTo(40, 45);
+    ctx.quadraticCurveTo(24, 33, 16, 12);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = steelDark;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(2, 22);
+    ctx.quadraticCurveTo(14, 40, 28, 48);
+    ctx.stroke();
+  }
+
+  /* ---------- barrel (BEFORE the handguard) ---------- */
+  if (A.form === "crossbow") {
+    ctx.strokeStyle = steel;
+    ctx.lineWidth = 7;
+    ctx.beginPath();
+    ctx.moveTo(BL * 0.72, -58);
+    ctx.quadraticCurveTo(BL * 0.92, -20, BL, 0);
+    ctx.quadraticCurveTo(BL * 0.92, 20, BL * 0.72, 58);
+    ctx.stroke();
+    ctx.strokeStyle = "#D8CDB4";
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(BL * 0.72, -58);
+    ctx.lineTo(60, 0);
+    ctx.lineTo(BL * 0.72, 58);
+    ctx.stroke();
+    ctx.fillStyle = wood;
+    ctx.beginPath();
+    ctx.roundRect(40, -6, BL - 40, 12, 3);
+    ctx.fill();
+    ctx.strokeStyle = "#C9B591";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(70, 0);
+    ctx.lineTo(BL - 8, 0);
+    ctx.stroke();
+  } else {
+    ctx.fillStyle = steel;
+    ctx.beginPath();
+    ctx.moveTo(46, -bore - 6);
+    ctx.lineTo(BL, -bore - 2);
+    ctx.lineTo(BL, bore + 2);
+    ctx.lineTo(46, bore + 6);
+    ctx.closePath();
+    ctx.fill();
+
+    if (A.mag === "tube") {
+      ctx.fillStyle = steelDark;
+      ctx.beginPath();
+      ctx.roundRect(52, 8, BL * 0.58, 9, 4);
+      ctx.fill();
+    }
+    if (A.brake) {
+      ctx.fillStyle = steelDark;
+      ctx.beginPath();
+      ctx.roundRect(BL - 22, -bore - 6, 26, (bore + 6) * 2, 2);
+      ctx.fill();
+      ctx.fillStyle = steel;
+      for (let i = 0; i < 3; i++) ctx.fillRect(BL - 18 + i * 7, -bore - 6, 3, (bore + 6) * 2);
+    }
+  }
+
+  /* ---------- handguard / forend, over the barrel ---------- */
+  const slide = Math.sin(clamp(reloadProgress, 0, 1) * Math.PI) * -26 * dip;
+  const fLen = Math.min(96, BL * 0.32);
+  if (A.forend === "wood") {
+    ctx.fillStyle = wood;
+    ctx.beginPath();
+    ctx.roundRect(64 + slide, -14, fLen, 28, 6);
+    ctx.fill();
+    ctx.fillStyle = woodLit;
+    ctx.fillRect(68 + slide, -13, fLen - 10, 4);
+    ctx.strokeStyle = woodDark;
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 6; i++) {
+      const gx = 76 + slide + i * 13;
+      if (gx > 60 + fLen) break;
+      ctx.beginPath();
+      ctx.moveTo(gx, -9);
+      ctx.lineTo(gx, 10);
+      ctx.stroke();
+    }
+  } else if (A.forend === "rail") {
+    // squared-off rail handguard with slots
+    ctx.fillStyle = steel;
+    ctx.beginPath();
+    ctx.roundRect(60 + slide, -15, fLen + 14, 30, 3);
+    ctx.fill();
+    ctx.fillStyle = steelDark;
+    for (let i = 0; i < 7; i++) {
+      const gx = 68 + slide + i * 14;
+      if (gx > 56 + fLen) break;
+      ctx.fillRect(gx, -8, 7, 16);
+    }
+    ctx.fillStyle = steelLit;
+    ctx.fillRect(62 + slide, -14, fLen + 8, 3);
+  }
+
+  /* ---------- heat shield ---------- */
+  if (A.shield) {
+    ctx.strokeStyle = steelLit;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.roundRect(168, -bore - 11, BL - 200, (bore + 11) * 2, 6);
+    ctx.stroke();
+    ctx.fillStyle = steelDark;
+    for (let i = 0; i < 6; i++) {
+      const hx = 178 + i * ((BL - 220) / 6);
+      ctx.beginPath();
+      ctx.ellipse(hx, -bore - 5, 4, 3, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.ellipse(hx, bore + 5, 4, 3, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  /* ---------- side shell carrier ---------- */
+  if (A.carrier) {
+    ctx.fillStyle = steelDark;
+    ctx.beginPath();
+    ctx.roundRect(-40, -34, 82, 18, 3);
+    ctx.fill();
+    for (let i = 0; i < 5; i++) {
+      const cx = -33 + i * 16;
+      ctx.fillStyle = "#B8863A";      // brass
+      ctx.beginPath();
+      ctx.roundRect(cx, -32, 13, 14, 2);
+      ctx.fill();
+      ctx.fillStyle = "#8C1F1F";      // red hull
+      ctx.beginPath();
+      ctx.roundRect(cx, -32, 13, 6, 2);
+      ctx.fill();
+    }
+  }
+
+  /* ---------- rim light ---------- */
+  ctx.strokeStyle = skin.shine ? "#FFFFFF" : C.amber;
+  ctx.globalAlpha = skin.shine ? 0.5 : 0.22;
+  ctx.lineWidth = skin.shine ? 2.4 : 1.5;
+  ctx.beginPath();
+  ctx.moveTo(52, -bore - 5);
+  ctx.lineTo(BL - 4, -bore - 1.5);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  if (skin.camo) {
+    ctx.fillStyle = "#20281C";
+    ctx.globalAlpha = 0.55;
+    for (let i = 0; i < 9; i++) {
+      const bx = 40 + i * (BL / 9);
+      ctx.beginPath();
+      ctx.ellipse(bx, ((i % 3) - 1) * 5, 13, 6, i * 0.7, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /* ---------- optics and sights ---------- */
+  if (A.optic === "scope") {
+    ctx.fillStyle = steel;
+    ctx.beginPath();
+    ctx.roundRect(40, -34, 96, 18, 5);
+    ctx.fill();
+    ctx.fillStyle = steelDark;
+    ctx.fillRect(46, -31, 84, 4);
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = steel;
+    ctx.beginPath();
+    ctx.moveTo(58, -17); ctx.lineTo(58, -6);
+    ctx.moveTo(118, -17); ctx.lineTo(118, -6);
+    ctx.stroke();
+    ctx.fillStyle = "#8FD6E8";
+    ctx.globalAlpha = 0.65;
+    ctx.beginPath();
+    ctx.ellipse(134, -25, 3.5, 7, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  } else if (A.optic === "dot") {
+    // compact red dot on a riser
+    ctx.fillStyle = steelDark;
+    ctx.fillRect(52, -18, 38, 6);
+    ctx.fillStyle = steel;
+    ctx.beginPath();
+    ctx.roundRect(56, -40, 30, 24, 3);
+    ctx.fill();
+    ctx.fillStyle = "#101418";
+    ctx.fillRect(60, -36, 22, 16);
+    ctx.fillStyle = "#E8483A";
+    ctx.beginPath();
+    ctx.arc(71, -28, 2.6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 0.35;
+    ctx.beginPath();
+    ctx.arc(71, -28, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  } else if (A.optic === "post") {
+    // AK front sight block and rear notch
+    ctx.fillStyle = steel;
+    ctx.fillRect(BL - 46, -bore - 20, 9, 16);
+    ctx.fillRect(60, -26, 8, 12);
+    ctx.fillStyle = steelDark;
+    ctx.fillRect(BL * 0.5, -bore - 13, 40, 7);
+  } else {
+    ctx.fillStyle = C.paper;
+    ctx.beginPath();
+    ctx.arc(BL - 6, -bore - 4, 2.6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  /* ---------- muzzle flash ---------- */
+  if (gun.muzzle > 0) {
+    const a = gun.muzzle / 130;
+    const tip = BL + (A.brake ? 6 : 0);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = C.paper;
+    ctx.beginPath();
+    ctx.moveTo(tip, -8);
+    ctx.lineTo(tip + 54 * a, -22 * a);
+    ctx.lineTo(tip + 74 * a, 0);
+    ctx.lineTo(tip + 54 * a, 22 * a);
+    ctx.lineTo(tip, 8);
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = a * 0.55;
+    ctx.fillStyle = C.amber;
+    ctx.beginPath();
+    ctx.ellipse(tip + 30 * a, 0, 40 * a, 20 * a, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.restore();
+}
+
+const MUTE_KEY = "limitout:muted";
+
+const Sound = {
+  ctx: null,
+  master: null,
+  noiseBuf: null,
+  muted: false,
+  ready: false,
+
+  init() {
+    if (this.ready) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try {
+      this.ctx = new AC();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = this.muted ? 0 : 0.55;
+
+      // Compressor catches the peaks so the blast can hit hard without
+      // clipping. Slow-ish attack lets the initial crack through intact.
+      this.comp = this.ctx.createDynamicsCompressor();
+      this.comp.threshold.value = -9;
+      this.comp.knee.value = 14;
+      this.comp.ratio.value = 6;
+      this.comp.attack.value = 0.005;
+      this.comp.release.value = 0.2;
+
+      this.master.connect(this.comp);
+      this.comp.connect(this.ctx.destination);
+
+      // Soft-clip curve. Real loud sounds distort — this is what separates
+      // a gunshot's grit from a clean synthetic pop.
+      const n = 1024;
+      this.curve = new Float32Array(n);
+      const k = 14;
+      for (let i = 0; i < n; i++) {
+        const x = (i * 2) / n - 1;
+        this.curve[i] = ((1 + k) * x) / (1 + k * Math.abs(x));
+      }
+
+      // one second of white noise, reused by every noise-based effect
+      const len = this.ctx.sampleRate;
+      this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+      const d = this.noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+
+      this.ready = true;
+    } catch {
+      this.ready = false;
+    }
+  },
+
+  resume() {
+    if (!this.ready) this.init();
+    if (this.ctx && this.ctx.state === "suspended") this.ctx.resume();
+  },
+
+  setMuted(m) {
+    this.muted = m;
+    if (this.master) this.master.gain.value = m ? 0 : 0.55;
+  },
+
+  // --- primitives -------------------------------------------------
+  noise(dur, filterType, freq, gain, sweepTo) {
+    if (!this.ready || this.muted) return;
+    const t = this.ctx.currentTime;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noiseBuf;
+    const f = this.ctx.createBiquadFilter();
+    f.type = filterType;
+    f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(f); f.connect(g); g.connect(this.master);
+    src.start(t);
+    src.stop(t + dur);
+  },
+
+  tone(freq, dur, type, gain, toFreq, delay = 0) {
+    if (!this.ready || this.muted) return;
+    const t = this.ctx.currentTime + delay;
+    const o = this.ctx.createOscillator();
+    o.type = type || "sine";
+    o.frequency.setValueAtTime(freq, t);
+    if (toFreq) o.frequency.exponentialRampToValueAtTime(toFreq, t + dur);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(gain, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t);
+    o.stop(t + dur + 0.02);
+  },
+
+  /* Instant attack. The old helper ramped gain up over 8ms, which rounds off
+     the transient — that softened edge is exactly what reads as "pop" rather
+     than "bang". Here the gain starts at full on the first sample. */
+  burst({ dur, type, freq, q, gain, sweepTo, delay = 0, dist = false, rate = 1 }) {
+    if (!this.ready || this.muted) return;
+    const t = this.ctx.currentTime + delay;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noiseBuf;
+    src.playbackRate.value = rate;
+    const f = this.ctx.createBiquadFilter();
+    f.type = type;
+    f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    if (q) f.Q.value = q;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+    src.connect(f);
+    if (dist) {
+      const ws = this.ctx.createWaveShaper();
+      ws.curve = this.curve;
+      f.connect(ws);
+      ws.connect(g);
+    } else {
+      f.connect(g);
+    }
+    g.connect(this.master);
+    src.start(t);
+    src.stop(t + dur + 0.02);
+  },
+
+  /* Deep body — the part you feel rather than hear. */
+  thump(f0, f1, dur, gain, delay = 0) {
+    if (!this.ready || this.muted) return;
+    const t = this.ctx.currentTime + delay;
+    const o = this.ctx.createOscillator();
+    o.type = "sine";
+    o.frequency.setValueAtTime(f0, t);
+    o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(gain, t); // instant
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g);
+    g.connect(this.master);
+    o.start(t);
+    o.stop(t + dur + 0.02);
+  },
+
+  /* A bubble's pitch RISES as it shrinks and rises through the water. That
+     upward sweep is the single cue that makes a noise burst read as water
+     instead of static. */
+  bubble(f0, f1, dur, gain, delay = 0) {
+    if (!this.ready || this.muted) return;
+    const t = this.ctx.currentTime + delay;
+    const o = this.ctx.createOscillator();
+    o.type = "sine";
+    o.frequency.setValueAtTime(f0, t);
+    o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(gain, t + dur * 0.3);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g);
+    g.connect(this.master);
+    o.start(t);
+    o.stop(t + dur + 0.02);
+  },
+
+  // --- effects ----------------------------------------------------
+  shot() {
+    // A gunshot is four layers, not one burst. The old version was too short,
+    // too clean, and had nothing below 150Hz — hence "pop".
+    // 1. the crack: instant, broadband, gone in 25ms
+    this.burst({ dur: 0.025, type: "highpass", freq: 2400, gain: 1.0, dist: true });
+    // 2. the body: this is the actual bang, driven into soft clipping
+    this.burst({ dur: 0.19, type: "lowpass", freq: 1800, sweepTo: 260, gain: 0.95, dist: true });
+    // 3. the chest thump: the low end that was missing entirely
+    this.thump(90, 32, 0.3, 0.9);
+    this.thump(58, 26, 0.42, 0.55);
+    // 4. slap-back off the treeline, then a long tail across open water
+    this.burst({ dur: 0.2, type: "bandpass", freq: 900, q: 1.1, gain: 0.2, delay: 0.14 });
+    this.burst({ dur: 1.0, type: "lowpass", freq: 700, sweepTo: 160, gain: 0.14, delay: 0.05 });
+  },
+
+  dry() {
+    // firing pin on an empty chamber
+    this.noise(0.035, "highpass", 3500, 0.3);
+    this.tone(900, 0.03, "square", 0.05);
+  },
+
+  pump() {
+    // shuck-shuck of the pump action
+    this.noise(0.06, "bandpass", 1400, 0.34);
+    this.tone(320, 0.05, "square", 0.09);
+    this.noise(0.07, "bandpass", 1000, 0.3);
+    setTimeout(() => {
+      this.noise(0.05, "bandpass", 1700, 0.3);
+      this.tone(420, 0.04, "square", 0.08);
+    }, 130);
+  },
+
+  hit() {
+    this.noise(0.12, "lowpass", 700, 0.34, 250);
+    this.tone(210, 0.09, "triangle", 0.16, 110);
+  },
+
+  splash() {
+    // The old version was one bandpass noise burst — that's a "shh", which
+    // reads as static or wind. Water needs impact, gulp, and bubbles.
+    // 1. mass breaking the surface
+    this.burst({ dur: 0.08, type: "lowpass", freq: 1400, sweepTo: 380, gain: 0.6 });
+    // 2. the gulp of displaced water closing over it
+    this.thump(240, 80, 0.13, 0.24);
+    // 3. bubbles — the actual signature of water
+    const n = 6 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < n; i++) {
+      const f0 = 280 + Math.random() * 520;
+      this.bubble(
+        f0,
+        f0 * (1.6 + Math.random() * 1.1),
+        0.045 + Math.random() * 0.06,
+        0.09 + Math.random() * 0.07,
+        0.02 + Math.random() * 0.26
+      );
+    }
+    // 4. spray settling back down
+    this.burst({ dur: 0.38, type: "highpass", freq: 2400, sweepTo: 5200, gain: 0.14, delay: 0.03 });
+  },
+
+  bark() {
+    this.tone(420, 0.07, "sawtooth", 0.2, 260);
+    this.tone(300, 0.09, "sawtooth", 0.14, 180, 0.09);
+  },
+
+  bank() {
+    // duck into the bag
+    this.tone(660, 0.07, "sine", 0.16);
+    this.tone(880, 0.1, "sine", 0.14, null, 0.06);
+  },
+
+  cash() {
+    [523, 659, 784].forEach((f, i) => this.tone(f, 0.16, "triangle", 0.16, null, i * 0.09));
+  },
+
+  best() {
+    [523, 659, 784, 1046].forEach((f, i) => this.tone(f, 0.24, "triangle", 0.2, null, i * 0.1));
+  },
+
+  flush() {
+    // wingbeats hammering off the ground — fast, rhythmic, urgent
+    for (let i = 0; i < 7; i++) {
+      this.burst({ dur: 0.06, type: "bandpass", freq: 260 + i * 26, q: 1.6,
+                   gain: 0.3 - i * 0.03, delay: i * 0.055 });
+    }
+    this.tone(180, 0.1, "triangle", 0.1, 320);
+  },
+
+  buckAppear() {
+    // low double grunt so you look up before you see him
+    this.tone(120, 0.13, "sawtooth", 0.12, 88);
+    this.tone(108, 0.15, "sawtooth", 0.1, 78, 0.18);
+  },
+
+  buck() {
+    // heavier than a bird: deep thump, then a rising payout chime
+    this.thump(70, 26, 0.4, 0.75);
+    this.burst({ dur: 0.22, type: "lowpass", freq: 900, sweepTo: 180, gain: 0.5, dist: true });
+    [392, 523, 659, 880].forEach((f, i) =>
+      this.tone(f, 0.28, "triangle", 0.2, null, 0.16 + i * 0.1));
+  },
+
+  lost() {
+    // a bird slipping under — glugs, then a muffled swallow
+    this.burst({ dur: 0.14, type: "lowpass", freq: 700, sweepTo: 200, gain: 0.26 });
+    for (let i = 0; i < 4; i++) {
+      const f0 = 200 + Math.random() * 220;
+      this.bubble(f0, f0 * 1.5, 0.07, 0.09, i * 0.07);
+    }
+    this.thump(180, 60, 0.3, 0.16, 0.05);
+  },
+};
+
+const MUTE_STORE = {
+  async load() {
+    try {
+      const r = await window.storage.get(MUTE_KEY);
+      return r?.value === "1";
+    } catch {
+      return false;
+    }
+  },
+  async save(m) {
+    try { await window.storage.set(MUTE_KEY, m ? "1" : "0"); } catch { /* fine */ }
+  },
+};
+
+function drawDog(ctx, dog, coat, coatDark, coatLit, t, moving) {
+  const facing = dog.state === "back" ? -1 : 1;
+  const g = dog.gait;
+  const bounce = moving ? Math.abs(Math.sin(g)) * 3.5 : 0;
+
+  ctx.save();
+  ctx.translate(dog.x, dog.y - bounce);
+  ctx.scale(facing, 1);
+
+  const swing = moving ? Math.sin(g) : 0;
+  const swingB = moving ? Math.sin(g + Math.PI) : 0;
+
+  // --- far legs first, darker, so the near pair reads in front
+  const leg = (hipX, hipY, phase, w, col) => {
+    const reach = phase * 9;
+    const lift = Math.abs(phase) * 3;
+    ctx.strokeStyle = col;
+    ctx.lineWidth = w;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(hipX, hipY);
+    ctx.quadraticCurveTo(hipX + reach * 0.4, hipY + 9, hipX + reach, 19 - lift);
+    ctx.stroke();
+    // paw
+    ctx.beginPath();
+    ctx.moveTo(hipX + reach, 19 - lift);
+    ctx.lineTo(hipX + reach + 3.5, 19 - lift);
+    ctx.stroke();
+  };
+
+  leg(13, 0, swingB, 3.5, coatDark);   // far front
+  leg(-17, 0, swing, 3.5, coatDark);   // far back
+
+  // --- tail, held up and wagging
+  ctx.strokeStyle = coat;
+  ctx.lineWidth = 4;
+  ctx.lineCap = "round";
+  const wag = Math.sin(t / 90) * 5;
+  ctx.beginPath();
+  ctx.moveTo(-22, -8);
+  ctx.quadraticCurveTo(-30, -13 + wag * 0.4, -34, -21 + wag);
+  ctx.stroke();
+
+  // --- body: a long rectangular torso. Real dogs are boxy in profile —
+  // flat topline, square chest, square rear, only a slight belly tuck.
+  ctx.fillStyle = coat;
+  ctx.beginPath();
+  ctx.moveTo(19, -11);                       // top of the chest / withers
+  ctx.lineTo(-16, -12);                      // flat topline back to the hips
+  ctx.quadraticCurveTo(-22, -12, -23, -6);   // squared rear corner
+  ctx.lineTo(-23, 2);                        // vertical rear
+  ctx.quadraticCurveTo(-22, 5, -15, 5);      // rump underside
+  ctx.lineTo(6, 7);                          // belly, deepest under the chest
+  ctx.lineTo(18, 6);                         // chest floor
+  ctx.quadraticCurveTo(21, 1, 20, -6);       // vertical chest front
+  ctx.closePath();
+  ctx.fill();
+
+  // shoulder and haunch blocks, a shade darker — gives the box some mass
+  ctx.fillStyle = coatDark;
+  ctx.globalAlpha = 0.35;
+  ctx.beginPath();
+  ctx.rect(-20, -8, 9, 12);                  // haunch
+  ctx.fill();
+  ctx.beginPath();
+  ctx.rect(9, -8, 8, 12);                    // shoulder
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // lit line along the flat topline
+  ctx.fillStyle = coat;
+  ctx.strokeStyle = coatLit;
+  ctx.lineWidth = 1.8;
+  ctx.beginPath();
+  ctx.moveTo(17, -10.5);
+  ctx.lineTo(-16, -11.5);
+  ctx.stroke();
+
+  // --- neck: short and thick, angled up from the shoulders
+  ctx.fillStyle = coat;
+  ctx.beginPath();
+  ctx.moveTo(13, -11);
+  ctx.lineTo(20, -20);
+  ctx.lineTo(27, -15);
+  ctx.lineTo(19, -6);
+  ctx.closePath();
+  ctx.fill();
+
+  // --- head
+  // skull — blockier than a circle, flat across the top
+  ctx.beginPath();
+  ctx.moveTo(20, -25);
+  ctx.lineTo(30, -24);
+  ctx.quadraticCurveTo(33, -23, 33, -19);
+  ctx.lineTo(31, -13);
+  ctx.lineTo(21, -13);
+  ctx.quadraticCurveTo(17, -19, 20, -25);
+  ctx.closePath();
+  ctx.fill();
+
+  // muzzle — a squared box, not a taper
+  ctx.beginPath();
+  ctx.moveTo(31, -21);
+  ctx.lineTo(41, -20);
+  ctx.lineTo(41, -14);
+  ctx.lineTo(31, -14);
+  ctx.closePath();
+  ctx.fill();
+
+  // nose
+  ctx.fillStyle = "#14100C";
+  ctx.beginPath();
+  ctx.roundRect(39, -21, 4, 5, 1.4);
+  ctx.fill();
+
+  // eye
+  ctx.beginPath();
+  ctx.arc(28, -20, 1.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  // floppy ear, hanging square off the back of the skull
+  ctx.fillStyle = coatDark;
+  ctx.beginPath();
+  ctx.moveTo(21, -25);
+  ctx.lineTo(16, -24);
+  ctx.lineTo(15, -12);
+  ctx.lineTo(22, -14);
+  ctx.closePath();
+  ctx.fill();
+
+  // --- near legs, on the opposite phase
+  leg(14, 1, swing, 4.5, coat);
+  leg(-16, 1, swingB, 4.5, coat);
+
+  // --- birds in the mouth
+  dog.carried.forEach((c, k) => {
+    const T = DUCKS[typeof c === "object" ? c.t : c];
+    ctx.fillStyle = T.body;
+    ctx.beginPath();
+    ctx.ellipse(44 + k * 2, -14 + k * 5, 11 * T.size, 5 * T.size, 0.35, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = T.head;
+    ctx.beginPath();
+    ctx.arc(52 + k * 2, -12 + k * 5, 3.4 * T.size, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  ctx.lineCap = "butt";
+  ctx.restore();
+}
+
+function drawBuck(ctx, b, t) {
+  const facing = b.dir >= 0 ? 1 : -1;
+  const down = !b.alive;
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  ctx.scale(facing, 1);
+  if (down) {
+    const k = Math.min(1, (b.fallT ?? 0) / 500);
+    ctx.rotate(k * 1.35);
+    ctx.globalAlpha = 1 - Math.max(0, ((b.fallT ?? 0) - 900) / 500);
+  }
+
+  const swing = down ? 0 : Math.sin(b.gait) * 8;
+  const swingB = down ? 0 : Math.sin(b.gait + Math.PI) * 8;
+
+  // legs — long and thin, that's the deer read
+  ctx.strokeStyle = "#4A3320";
+  ctx.lineWidth = 3;
+  ctx.lineCap = "round";
+  [[-14, swing], [-10, swingB], [12, swingB], [16, swing]].forEach(([hx, sw]) => {
+    ctx.beginPath();
+    ctx.moveTo(hx, -6);
+    ctx.quadraticCurveTo(hx + sw * 0.4, 6, hx + sw, 22);
+    ctx.stroke();
+  });
+
+  // body — rectangular, deep chest, high withers
+  ctx.fillStyle = BUCK.body;
+  ctx.beginPath();
+  ctx.moveTo(20, -22);
+  ctx.lineTo(-14, -20);
+  ctx.quadraticCurveTo(-20, -19, -21, -12);
+  ctx.lineTo(-20, -2);
+  ctx.lineTo(-12, -1);
+  ctx.lineTo(12, -3);
+  ctx.lineTo(21, -8);
+  ctx.closePath();
+  ctx.fill();
+
+  // pale belly and rump patch
+  ctx.fillStyle = BUCK.belly;
+  ctx.fillRect(-10, -5, 22, 4);
+  ctx.beginPath();
+  ctx.ellipse(-19, -8, 4, 6, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // neck and head, carried high
+  ctx.fillStyle = BUCK.body;
+  ctx.beginPath();
+  ctx.moveTo(16, -20);
+  ctx.lineTo(26, -38);
+  ctx.lineTo(33, -36);
+  ctx.lineTo(24, -16);
+  ctx.closePath();
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(26, -42);
+  ctx.lineTo(38, -40);
+  ctx.lineTo(41, -34);
+  ctx.lineTo(28, -34);
+  ctx.closePath();
+  ctx.fill();
+  // muzzle
+  ctx.beginPath();
+  ctx.moveTo(38, -40);
+  ctx.lineTo(46, -38);
+  ctx.lineTo(46, -34);
+  ctx.lineTo(38, -34);
+  ctx.closePath();
+  ctx.fill();
+  // ear
+  ctx.fillStyle = "#523venue";
+  ctx.fillStyle = "#523A24";
+  ctx.beginPath();
+  ctx.moveTo(27, -43);
+  ctx.lineTo(21, -47);
+  ctx.lineTo(24, -39);
+  ctx.closePath();
+  ctx.fill();
+
+  // the rack — the whole reason he's worth stopping for
+  ctx.strokeStyle = BUCK.antler;
+  ctx.lineWidth = 2.4;
+  ctx.lineCap = "round";
+  [-1, 1].forEach((side) => {
+    const ox = side > 0 ? 32 : 28;
+    ctx.beginPath();
+    ctx.moveTo(ox, -44);
+    ctx.quadraticCurveTo(ox + 9, -58, ox + 2, -66);
+    ctx.stroke();
+    for (let k = 0; k < 3; k++) {
+      const ty = -50 - k * 6;
+      ctx.beginPath();
+      ctx.moveTo(ox + 6 - k, ty);
+      ctx.lineTo(ox + 13 - k * 2, ty - 7);
+      ctx.stroke();
+    }
+  });
+
+  // eye
+  ctx.fillStyle = "#100C08";
+  ctx.beginPath();
+  ctx.arc(33, -38, 1.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.lineCap = "butt";
+  ctx.restore();
+}
+
+function drawTurkey(ctx, d, T) {
+  const air = !d.onGround;
+
+  // Geometry below was drawn oversized; these bring the silhouette down to
+  // roughly 1.5x a mallard. Strutting is compact and tall, flight is broad.
+  ctx.scale(air ? 0.85 : 0.5, air ? 0.85 : 0.5);
+
+  if (!air) {
+    // --- strutting on the ground ---------------------------------
+    const bob = Math.sin(d.strut) * 1.5;
+
+    // vertical fan tail, spread behind like a hand of cards
+    for (let f = -5; f <= 5; f++) {
+      const a = f * 0.155;
+      ctx.save();
+      ctx.translate(-13, -6 + bob);
+      ctx.rotate(a);
+      ctx.fillStyle = f % 2 ? "#3A2F1E" : "#4A3B24";
+      ctx.beginPath();
+      ctx.ellipse(0, -20, 4.2, 21, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#8A7038";        // pale barred tip
+      ctx.beginPath();
+      ctx.ellipse(0, -37, 3.6, 4.5, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // heavy rounded body, sitting low and upright
+    ctx.fillStyle = T.body;
+    ctx.beginPath();
+    ctx.ellipse(0, bob, 17, 15, -0.12, 0, Math.PI * 2);
+    ctx.fill();
+
+    // bronze wing bar across the flank
+    ctx.fillStyle = T.mark;
+    ctx.beginPath();
+    ctx.ellipse(-2, 3 + bob, 12, 5.5, -0.15, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#D8CFB4";          // white wing bars
+    ctx.fillRect(-11, 6 + bob, 13, 1.6);
+    ctx.fillRect(-10, 9 + bob, 11, 1.4);
+
+    // long neck rising from the chest
+    ctx.strokeStyle = "#3E2E22";
+    ctx.lineWidth = 6;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(9, -6 + bob);
+    ctx.quadraticCurveTo(16, -16 + bob, 14, -25 + bob);
+    ctx.stroke();
+
+    // small bare head
+    ctx.fillStyle = T.head;
+    ctx.beginPath();
+    ctx.ellipse(15, -29 + bob, 5.5, 5, 0.2, 0, Math.PI * 2);
+    ctx.fill();
+    // pale crown
+    ctx.fillStyle = "#B8CBD6";
+    ctx.beginPath();
+    ctx.ellipse(14, -32 + bob, 4, 2.4, 0.1, 0, Math.PI * 2);
+    ctx.fill();
+    // snood over the bill, and the wattle beneath
+    ctx.strokeStyle = "#8A3A34";
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    ctx.moveTo(19, -31 + bob);
+    ctx.quadraticCurveTo(23, -29 + bob, 22, -24 + bob);
+    ctx.stroke();
+    ctx.fillStyle = "#8A3A34";
+    ctx.beginPath();
+    ctx.ellipse(13, -24 + bob, 3.4, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // bill
+    ctx.fillStyle = T.bill;
+    ctx.beginPath();
+    ctx.moveTo(19, -30 + bob);
+    ctx.lineTo(25, -28 + bob);
+    ctx.lineTo(19, -27 + bob);
+    ctx.closePath();
+    ctx.fill();
+
+    // beard hanging off the chest
+    ctx.strokeStyle = "#171310";
+    ctx.lineWidth = 2.6;
+    ctx.beginPath();
+    ctx.moveTo(10, -1 + bob);
+    ctx.lineTo(12, 11 + bob);
+    ctx.stroke();
+
+    // thick legs
+    ctx.strokeStyle = "#9A6A34";
+    ctx.lineWidth = 3;
+    const step = Math.sin(d.strut) * 3;
+    [[-4, step], [4, -step]].forEach(([lx, sw]) => {
+      ctx.beginPath();
+      ctx.moveTo(lx, 12);
+      ctx.lineTo(lx + sw, 23);
+      ctx.stroke();
+      ctx.beginPath();       // foot
+      ctx.moveTo(lx + sw - 3, 23);
+      ctx.lineTo(lx + sw + 4, 23);
+      ctx.stroke();
+    });
+    ctx.lineCap = "butt";
+    return;
+  }
+
+  // --- in the air ------------------------------------------------
+  const flap = Math.sin(d.wing) * 16;
+
+  // trailing tail, closed flat now rather than fanned
+  ctx.fillStyle = "#3A2F1E";
+  ctx.beginPath();
+  ctx.moveTo(-14, -2);
+  ctx.lineTo(-34, -8);
+  ctx.lineTo(-34, 4);
+  ctx.lineTo(-14, 4);
+  ctx.closePath();
+  ctx.fill();
+
+  // heavy barrel body
+  ctx.fillStyle = T.body;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 18, 11, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // neck stretched straight out, head low and forward
+  ctx.strokeStyle = "#3E2E22";
+  ctx.lineWidth = 6;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(13, -3);
+  ctx.lineTo(27, -7);
+  ctx.stroke();
+  ctx.fillStyle = T.head;
+  ctx.beginPath();
+  ctx.ellipse(30, -8, 5, 4.5, 0.1, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = T.bill;
+  ctx.beginPath();
+  ctx.moveTo(34, -9);
+  ctx.lineTo(40, -7);
+  ctx.lineTo(34, -6);
+  ctx.closePath();
+  ctx.fill();
+
+  // broad slow wings — the giveaway that it isn't a duck
+  ctx.fillStyle = "#241D14";
+  ctx.beginPath();
+  ctx.ellipse(-2, -6 - flap * 0.5, 22, 8, -flap * 0.035, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#5A4A2C";
+  ctx.beginPath();
+  ctx.ellipse(-4, -5 - flap * 0.5, 16, 4.5, -flap * 0.035, 0, Math.PI * 2);
+  ctx.fill();
+
+  // tucked legs
+  ctx.strokeStyle = "#9A6A34";
+  ctx.lineWidth = 2.4;
+  ctx.beginPath();
+  ctx.moveTo(2, 9);
+  ctx.lineTo(-6, 13);
+  ctx.stroke();
+  ctx.lineCap = "butt";
+}
+
+/* Effective stats. A weapon scales the gun tier rather than replacing it,
+   so nothing you already bought is wasted when you switch guns. */
+function weaponOf(meta) {
+  return WEAPONS.find((w) => w.id === (meta.weapon || "pump")) || WEAPONS[0];
+}
+function skinOf(meta) {
+  return SKINS.find((k) => k.id === (meta.skin || "blued")) || SKINS[0];
+}
+function shellsFor(meta) {
+  return Math.max(1, Math.round(GUN[meta.lvl.gun].shells * weaponOf(meta).shellMul));
+}
+function reloadFor(meta) {
+  return Math.max(120, Math.round(GUN[meta.lvl.gun].reload * weaponOf(meta).reloadMul));
+}
+function spreadFor(meta) {
+  return Math.round(CHOKE[meta.lvl.choke ?? 0].bonus * weaponOf(meta).spreadMul);
+}
+function pelletsFor(meta) {
+  return Math.max(1, PELLET[meta.lvl.pellet ?? 0].birds + weaponOf(meta).pelletAdd);
+}
+
+
+
+function spawnDuck() {
+    const s = G;
+    const r = META.round;
+    const ti = pickDuckType(r, META.ducks || DUCKS.map((_, i) => i === 0), PLACES[META.place ?? 0].id);
+    const T = DUCKS[ti];
+    const PL = PLACES[META.place ?? 0];
+    const fromLeft = Math.random() < 0.5;
+    const speed =
+      (70 + Math.random() * 55 + r * 9) * T.speedMul * PL.speedMul * (fromLeft ? 1 : -1);
+    const [y0, y1] = T.yBand;
+    s.ducks.push({
+      id: s.nextId++,
+      t: ti,
+      x: (fromLeft ? -50 : W + 50) + (Math.random() - 0.5) * 90,
+      y: y0 + Math.random() * (y1 - y0),
+      vx: speed,
+      bob: Math.random() * Math.PI * 2,
+      bobAmp: (8 + Math.random() * 16) * T.bob,
+      alive: true,
+      vy: 0,
+      wing: Math.random() * Math.PI * 2,
+      // ground birds walk until something puts them in the air
+      onGround: !!T.ground,
+      flushed: false,
+      flushIn: 0,   // only the flushing dog puts them in the air
+      strut: Math.random() * Math.PI * 2,
+    });
+  }
+
+function fire(gx, gy) {
+    const s = G;
+    if (!s || s.over || s.paused) return;
+    s.aim = { x: gx, y: gy };
+    tryReload(s, META); // reload can complete even if the loop is dead
+    if (s.shells <= 0) {
+      // A rejected tap MUST produce feedback, or the gun reads as broken.
+      s.dry = { x: gx, y: gy, life: 220 };
+      Sound.dry();
+      return;
+    }
+
+    s.shells -= 1;
+    s.flash = { x: gx, y: gy, life: 120 };
+    Sound.shot();
+    s.gun.recoil = 1;
+    s.gun.muzzle = 130;
+    // eject the spent shell from the receiver
+    {
+      const a = s.gun.ang;
+      const fl = Math.cos(a) < 0 ? -1 : 1;
+      const oy = -12 * fl;
+      const rx = GUN_PIVOT.x + Math.cos(a) * 34 - Math.sin(a) * oy;
+      const ry = GUN_PIVOT.y + Math.sin(a) * 34 + Math.cos(a) * oy;
+      const eject = a - (Math.PI / 2) * fl;
+      s.parts.push({
+        x: rx, y: ry,
+        vx: Math.cos(eject) * 120 + 40 * fl,
+        vy: Math.sin(eject) * 120 - 70,
+        life: 1100, max: 1100, kind: "shell", rot: a,
+      });
+    }
+    if (!REDUCED) s.shake = 6;
+
+    // --- pattern resolution --------------------------------------
+    // Choke widens the effective pattern; pellet count caps how many birds
+    // a single shell can take if they're inside it together.
+    const spread = spreadFor(META);
+    const maxBirds = pelletsFor(META);
+
+    // the buck first — one shot, no dog, straight to money
+    if (s.buck && s.buck.alive && !s.buck.out && s.buck.appearIn <= 0) {
+      const b = s.buck;
+      if (Math.hypot(b.x - gx, b.y - gy) < BUCK.hit + spread) {
+        b.alive = false;
+        b.fallT = 0;
+        const paid = Math.round(BUCK.value * PLACES[s.place ?? 0].valueMul * weaponOf(META).valueMul);
+        META.money += paid;
+        s.buckTaken += 1;
+        s.takeValue += paid;
+        s.buckFlash = { x: b.x, y: b.y, life: 1500, paid };
+        Sound.buck();
+        for (let i = 0; i < 18; i++) {
+          s.parts.push({
+            x: b.x, y: b.y - 10,
+            vx: (Math.random() - 0.5) * 110,
+            vy: -Math.random() * 70,
+            life: 900, max: 1400, kind: "feather", rot: Math.random() * 6,
+          });
+        }
+        return;
+      }
+    }
+
+    const inPattern = [];
+    for (const d of s.ducks) {
+      if (!d.alive) continue;
+      if (d.onGround) continue;   // no shot at a bird on the ground
+      const dist = Math.hypot(d.x - gx, d.y - gy);
+      if (dist < DUCKS[d.t ?? 0].hit + spread) inPattern.push({ d, dist });
+    }
+
+
+    inPattern.sort((a, b) => a.dist - b.dist);
+    const struck = inPattern.slice(0, maxBirds);
+
+    if (struck.length) {
+      Sound.hit();
+      for (const { d: hit } of struck) {
+        hit.alive = false;
+        hit.vy = -30;
+        hit.wasFlushed = !!hit.flushed;   // remembered for the payout
+        for (let i = 0; i < 14; i++) {
+          s.parts.push({
+            x: hit.x, y: hit.y,
+            vx: (Math.random() - 0.5) * 90,
+            vy: -Math.random() * 60,
+            life: 900 + Math.random() * 600,
+            max: 1400, kind: "feather", rot: Math.random() * 6,
+          });
+        }
+      }
+      if (struck.length > 1) {
+        s.multi = { n: struck.length, x: gx, y: gy, life: 950 };
+        Sound.bank();
+      }
+    } else {
+      s.missed += 1;
+      for (let i = 0; i < 5; i++) {
+        s.parts.push({
+          x: gx, y: gy,
+          vx: (Math.random() - 0.5) * 60,
+          vy: (Math.random() - 0.5) * 60,
+          life: 260, max: 260, kind: "puff", rot: 0,
+        });
+      }
+    }
+
+    if (s.shells <= 0) s.reloadUntil = performance.now() + reloadFor(META);
+  }
+
+function step(dt) {
+    const s = G;
+    const m = META;
+    if (!s || s.over) return;
+
+    s.t += dt;
+    s.time -= dt;
+    s.shake *= 0.86;
+
+    s.frames += 1;
+    tryReload(s, m);
+
+    // gun follows the aim point, dips while reloading
+    {
+      const gun = s.gun;
+      const reloading = s.shells <= 0;
+      const aim = s.aim || { x: GUN_PIVOT.x - 60, y: 240 };
+      let target = Math.atan2(aim.y - GUN_PIVOT.y, aim.x - GUN_PIVOT.x);
+      target = clamp(target, GUN_MIN_ANG, GUN_MAX_ANG);
+      const k = Math.min(1, dt / 110);
+      gun.ang += (target - gun.ang) * k;
+      gun.dip += ((reloading ? 1 : 0) - gun.dip) * Math.min(1, dt / 160);
+      gun.recoil *= Math.pow(0.86, dt / 16);
+      if (gun.recoil < 0.01) gun.recoil = 0;
+      if (gun.muzzle > 0) gun.muzzle -= dt;
+    }
+    if (s.refill > 0) s.refill -= dt;
+    if (s.dry) {
+      s.dry.life -= dt;
+      if (s.dry.life <= 0) s.dry = null;
+    }
+
+    // spawn
+    s.spawnIn -= dt;
+    if (s.spawnIn <= 0) {
+      // Birds must arrive fast enough to actually fill the bag you bought.
+      // Work backwards from capacity: aim to put ~2.4x the bag on the wing
+      // per round, so filling it is possible but demands a good round.
+      const cap = BAG[m.lvl.bag ?? 0].cap;
+      const PL = PLACES[m.place ?? 0];
+      const flock = Math.min(cap >= 120 ? 3 : cap >= 42 ? 2 : 1, PL.flockCap ?? 3);
+      // density guard — keeps the frame cheap and the sky readable
+      const room = Math.max(0, 72 - s.ducks.length);
+      for (let f = 0; f < Math.min(flock, room); f++) spawnDuck();
+      const wanted = clamp(cap * 2.4, 40, 500) * (PL.spawnMul ?? 1);
+      const avgGap = (ROUND_MS * flock) / wanted;
+      // Round difficulty tightens the gap, but only slightly — uncapped it
+      // compounded with capacity and buried the top tiers in birds.
+      const raw = avgGap / 1.225;
+      const base = Math.max(150, raw - Math.min(m.round * 3, raw * 0.12));
+      s.spawnIn = base + Math.random() * (base * 0.45);
+    }
+
+    // --- turkeys on the ground, and the flush ---------------------
+    for (const d of s.ducks) {
+      // A bird shot while still on the ground must be released from ground
+      // handling, or it falls between this loop (skips the dead) and the
+      // flight loop (skips the grounded) and sits there forever.
+      if (!d.alive) { d.onGround = false; continue; }
+      if (!d.onGround) continue;
+      d.strut += dt / 260;
+      d.x += (d.vx * dt) / 1000;
+      // they just walk; the dog decides when they fly
+    }
+
+    // --- the flushing dog -----------------------------------------
+    // Hunts the nearest bird still on the ground, flushes everything inside
+    // its radius, then catches its breath. Rate of flushing is the whole
+    // ceiling on a ridge round, so every tier of this upgrade is felt.
+    if (s.flusher) {
+      const fl = s.flusher;
+      const spec = FLUSHER[m.lvl.flusher ?? 0];
+      if (fl.puff > 0) fl.puff -= dt;
+
+      if (fl.state === "rest") {
+        fl.restLeft -= dt;
+        if (fl.restLeft <= 0) fl.state = "hunt";
+      } else {
+        let mark = null, md = 1e9;
+        for (const d of s.ducks) {
+          if (!d.alive || !d.onGround) continue;
+          const dd = Math.abs(d.x - fl.x);
+          if (dd < md) { md = dd; mark = d; }
+        }
+        if (mark) {
+          const dx = mark.x - fl.x;
+          fl.dir = dx >= 0 ? 1 : -1;
+          fl.gait += dt / 55;
+          if (Math.abs(dx) > spec.radius * 0.55) {
+            fl.x += Math.sign(dx) * spec.speed * dt / 1000;
+          } else {
+            // close enough — put up everything in the radius
+            let flushed = 0;
+            for (const d of s.ducks) {
+              if (d.alive && d.onGround && Math.hypot(d.x - fl.x, d.y - fl.y) < spec.radius) {
+                flushBird(s, d);
+                flushed++;
+              }
+            }
+            if (flushed) {
+              fl.puff = 420;
+              fl.state = "rest";
+              fl.restLeft = spec.rest;
+            }
+          }
+        } else {
+          // nothing to work — drift back toward the middle
+          const home = W * 0.5;
+          if (Math.abs(fl.x - home) > 6) {
+            fl.dir = fl.x < home ? 1 : -1;
+            fl.gait += dt / 80;
+            fl.x += Math.sign(home - fl.x) * spec.speed * 0.45 * dt / 1000;
+          }
+        }
+      }
+      fl.x = clamp(fl.x, 20, W - 20);
+    }
+
+    // --- the buck -------------------------------------------------
+    if (s.buck && !s.buck.out) {
+      const b = s.buck;
+      if (b.appearIn > 0) {
+        b.appearIn -= dt;
+        if (b.appearIn <= 0) {
+          b.dir = b.x < 0 ? 1 : -1;
+          Sound.buckAppear();
+        }
+      } else if (b.alive) {
+        b.gait += dt / 150;
+        const speed = (W + 160) / (BUCK.crossMs / 1000);
+        b.x += b.dir * speed * dt / 1000;
+        if (b.x < -80 || b.x > W + 80) b.out = true;   // slipped away
+      } else {
+        b.fallT = (b.fallT ?? 0) + dt;
+        if (b.fallT > 1400) b.out = true;
+      }
+    }
+
+    // ducks
+    for (const d of s.ducks) {
+      if (d.onGround) continue;              // handled above
+      if (d.alive) {
+        d.x += (d.vx * dt) / 1000;
+        d.bob += dt / 380;
+        d.wing += dt / 70;
+        if (d.climb > 0) {
+          // hard climb straight off the ground, easing out as it levels
+          d.y -= (d.climb * dt) / 1000;
+          d.climb *= Math.pow(0.985, dt / 16);
+          if (d.climb < 12) d.climb = 0;
+        }
+        d.y += Math.sin(d.bob) * (d.bobAmp * dt) / 1000;
+      } else {
+        d.vy += (900 * dt) / 1000;
+        d.y += (d.vy * dt) / 1000;
+        d.x += (d.vx * 0.25 * dt) / 1000;
+        if (d.y >= WATER_Y) {
+          d.landed = true;
+          Sound.splash();
+          s.floats.push({
+            id: d.id,
+            t: d.t ?? 0,
+            bonus: d.wasFlushed ? (DUCKS[d.t ?? 0].flushBonus || 1) : 1,
+            x: clamp(d.x, 40, W - 40),
+            y: WATER_Y,
+            life: FLOAT_MS * PLACES[s.place ?? 0].floatMul,
+            claimed: false,
+            bob: 0,
+          });
+          for (let i = 0; i < 10; i++) {
+            s.parts.push({
+              x: d.x, y: WATER_Y,
+              vx: (Math.random() - 0.5) * 120,
+              vy: -Math.random() * 110,
+              life: 500, max: 500, kind: "splash", rot: 0,
+            });
+          }
+        }
+      }
+    }
+    s.ducks = s.ducks.filter((d) => !d.landed && d.x > -90 && d.x < W + 90);
+
+    // floating birds decay — this is what makes dog speed matter
+    for (const f of s.floats) {
+      f.life -= dt;
+      f.bob += dt / 300;
+    }
+    const expired = s.floats.filter((f) => f.life <= 0);
+    if (expired.length) {
+      s.lost += expired.length;
+      Sound.lost();
+      for (const f of expired) {
+        for (let i = 0; i < 8; i++) {
+          s.parts.push({
+            x: f.x, y: WATER_Y, vx: (Math.random() - 0.5) * 60,
+            vy: -Math.random() * 40, life: 450, max: 450, kind: "splash", rot: 0,
+          });
+        }
+      }
+    }
+    s.floats = s.floats.filter((f) => f.life > 0);
+
+    // --- dogs ----------------------------------------------------
+    // Each dog works independently and keeps collecting until it's full or
+    // the water is clear, then runs the whole load home.
+    const bagCap = BAG[m.lvl.bag].cap;
+    const homeFor = (i2) => KENNEL.x + i2 * 58;
+
+    s.dogs.forEach((dog, di) => {
+      const spec = DOG[m.lvl[di === 0 ? "dog" : "dog2"] ?? 0];
+      const speed = spec.speed;
+      const capacity = spec.carry;
+      const claimNearest = () => {
+        const open = s.floats.filter((f) => !f.claimed);
+        if (!open.length) return null;
+        let pick = open[0], bd = 1e9;
+        for (const f of open) {
+          const d2 = Math.abs(f.x - dog.x);
+          if (d2 < bd) { bd = d2; pick = f; }
+        }
+        pick.claimed = true;
+        return pick.id;
+      };
+
+      if (dog.state === "idle") {
+        if (s.bagged < bagCap) {
+          const id = claimNearest();
+          if (id !== null) { dog.targets = [id]; dog.carried = []; dog.state = "out"; }
+        }
+      } else if (dog.state === "out") {
+        const tid = dog.targets[0];
+        const tf = s.floats.find((f) => f.id === tid);
+        if (!tf) {
+          dog.targets = [];
+          dog.state = dog.carried.length ? "back" : "idle";
+        } else {
+          const dx = tf.x - dog.x, dy = WATER_Y + 26 - dog.y;
+          const dist = Math.hypot(dx, dy);
+          dog.gait += dt / 60;
+          if (dist < 8) {
+            s.floats = s.floats.filter((f) => f.id !== tid);
+            dog.carried.push({ t: tf.t ?? 0, bonus: tf.bonus || 1 });
+            dog.targets = [];
+            Sound.bark();
+            const room = capacity - dog.carried.length;
+            const next = room > 0 && s.bagged + dog.carried.length < bagCap ? claimNearest() : null;
+            if (next !== null) dog.targets = [next];
+            else dog.state = "back";
+          } else {
+            dog.x += (dx / dist) * speed * dt / 1000;
+            dog.y += (dy / dist) * speed * dt / 1000;
+          }
+        }
+      } else if (dog.state === "back") {
+        const hx = homeFor(di);
+        const dx = hx - dog.x, dy = KENNEL.y - dog.y;
+        const dist = Math.hypot(dx, dy);
+        dog.gait += dt / 60;
+        if (dist < 8) {
+          if (dog.carried.length) {
+            const mul = PLACES[s.place ?? 0].valueMul * weaponOf(m).valueMul;
+            for (const c of dog.carried) {
+              const ti = typeof c === "object" ? c.t : c;
+              const bonus = typeof c === "object" ? c.bonus : 1;
+              s.bagged += 1;
+              s.takeValue += Math.round(DUCKS[ti].value * mul * bonus);
+              s.byType[ti] = (s.byType[ti] || 0) + 1;
+            }
+            dog.carried = [];
+            Sound.bank();
+          }
+          dog.state = "idle";
+          dog.targets = [];
+        } else {
+          dog.x += (dx / dist) * speed * dt / 1000;
+          dog.y += (dy / dist) * speed * dt / 1000;
+        }
+      }
+    });
+
+    // --- hired hunter --------------------------------------------
+    if (s.h2) {
+      const h = s.h2;
+      const spec = HUNTER2[m.lvl.hunter2 ?? 0];
+      h.recoil *= Math.pow(0.86, dt / 16);
+      if (h.muzzle > 0) h.muzzle -= dt;
+      h.nextShot -= dt;
+
+      let mark = null, md = 1e9;
+      for (const d of s.ducks) {
+        if (!d.alive) continue;
+        const dd = Math.hypot(d.x - h.x, d.y - h.y);
+        if (dd < md) { md = dd; mark = d; }
+      }
+      if (mark) {
+        const target = clamp(Math.atan2(mark.y - h.y, mark.x - h.x), -Math.PI * 0.92, -Math.PI * 0.06);
+        h.ang += (target - h.ang) * Math.min(1, dt / 140);
+      }
+      if (h.nextShot <= 0 && mark && s.bagged < bagCap) {
+        h.nextShot = spec.every * (0.8 + Math.random() * 0.4);
+        h.recoil = 1;
+        h.muzzle = 120;
+        Sound.shot();
+        if (Math.random() < spec.acc) {
+          mark.alive = false;
+          mark.vy = -30;
+          for (let i2 = 0; i2 < 10; i2++) {
+            s.parts.push({
+              x: mark.x, y: mark.y,
+              vx: (Math.random() - 0.5) * 80,
+              vy: -Math.random() * 55,
+              life: 900, max: 1400, kind: "feather", rot: Math.random() * 6,
+            });
+          }
+        }
+      }
+    }
+
+    if (s.multi) { s.multi.life -= dt; if (s.multi.life <= 0) s.multi = null; }
+    if (s.buckFlash) { s.buckFlash.life -= dt; if (s.buckFlash.life <= 0) s.buckFlash = null; }
+
+    // particles
+    for (const p of s.parts) {
+      p.life -= dt;
+      p.x += (p.vx * dt) / 1000;
+      p.y += (p.vy * dt) / 1000;
+      p.vy += (p.kind === "feather" ? 90 : 300) * dt / 1000;
+      if (p.kind === "feather") p.vx *= 0.985;
+      p.rot += dt / 200;
+    }
+    s.parts = s.parts.filter((p) => p.life > 0);
+
+    if (s.flash) {
+      s.flash.life -= dt;
+      if (s.flash.life <= 0) s.flash = null;
+    }
+
+    // end conditions
+    const bagFull = s.bagged >= bagCap;
+    if (s.time <= 0 || bagFull) {
+      s.over = true;
+      const earned = s.takeValue;
+      m.money += earned;
+      const isBest = s.bagged > (m.best ?? 0);
+      if (isBest) m.best = s.bagged;
+
+      // Gold shells are earned, not just bought — the game is never
+      // gated behind a purchase.
+      let gbEarned = GB.perRound;
+      if (bagFull) gbEarned += GB.perFullBag;
+      if (s.buckTaken) gbEarned += GB.perBuck * s.buckTaken;
+      if (isBest) gbEarned += GB.perBest;
+      m.gb = (m.gb || 0) + gbEarned;
+      UI.results({
+        bagged: s.bagged,
+        lost: s.lost,
+        missed: s.missed,
+        isBest,
+        place: s.place ?? 0,
+        buckTaken: s.buckTaken || 0,
+        gbEarned,
+        byType: { ...s.byType },
+        earned,
+        reason: bagFull ? "Bag full" : "Light's gone",
+      });
+      UI.wallet();
+      
+      
+      UI.show("results");
+      if (isBest) Sound.best(); else Sound.cash();
+      persist();
+      if (isBest) Save.submitScore(m.best); // no-op on web; Game Center seam
+    }
+  }
+
+function draw(ctx) {
+    const s = G;
+    if (!s) return;
+    const sh = s.shake;
+    const ox = REDUCED ? 0 : (Math.random() - 0.5) * sh;
+    const oy = REDUCED ? 0 : (Math.random() - 0.5) * sh;
+
+    ctx.save();
+    ctx.translate(ox, oy);
+
+    // Unconditional full-frame clear. Every layer below is allowed to be
+    // place-specific; this one never is. Without it, any branch that fails
+    // to cover a region leaves the previous frame smeared underneath.
+    ctx.fillStyle = "#0A1119";
+    ctx.fillRect(-30, -30, W + 60, H + 60);
+
+    // sky
+    const P = PLACES[s.place ?? 0];
+    const sky = ctx.createLinearGradient(0, 0, 0, WATER_Y);
+    sky.addColorStop(0, P.sky[0]);
+    sky.addColorStop(0.55, P.sky[1]);
+    sky.addColorStop(0.85, P.sky[2]);
+    sky.addColorStop(1, P.sky[3]);
+    ctx.fillStyle = sky;
+    ctx.fillRect(-20, -20, W + 40, WATER_Y + 20);
+
+    // sun
+    ctx.fillStyle = P.sun;
+    ctx.globalAlpha = 0.9;
+    ctx.beginPath();
+    ctx.arc(P.sunX, P.sunY, P.sunR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 0.16;
+    ctx.beginPath();
+    ctx.arc(P.sunX, P.sunY, P.sunR * 2.1, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // --- BANKS (per place, above the waterline) -------------------
+    if (P.id === "bayou") {
+      // --- MARSH ---
+      // back cypress bands, pre-rendered once (they're distant, no sway needed)
+      if (BG) ctx.drawImage(BG, 0, 0, W, H);
+      // far reed bank: a low ragged wall of grass, not a forest silhouette
+      ctx.fillStyle = C.sedgeFar;
+      ctx.beginPath();
+      ctx.moveTo(0, WATER_Y);
+      for (let x = 0; x <= W; x += 6) {
+        const h =
+          16 +
+          Math.sin(x * 0.021) * 7 +
+          Math.sin(x * 0.077) * 4 +
+          Math.sin(x * 0.31) * 3;
+        ctx.lineTo(x, WATER_Y - h);
+      }
+      ctx.lineTo(W, WATER_Y);
+      ctx.closePath();
+      ctx.fill();
+
+      // far cattail stalks poking above the bank
+      ctx.strokeStyle = C.sedgeFar;
+      ctx.lineWidth = 1.5;
+      for (let i = 0; i < 60; i++) {
+        const x = (i * 137) % W;
+        const h = 20 + ((i * 53) % 26);
+        const sway = Math.sin(s.t / 1400 + i) * 2;
+        ctx.beginPath();
+        ctx.moveTo(x, WATER_Y - 10);
+        ctx.lineTo(x + sway, WATER_Y - 10 - h);
+        ctx.stroke();
+      }
+
+      // mid bank: a nearer, darker island of sedge with a mud shoulder
+      ctx.fillStyle = C.sedgeMid;
+      ctx.beginPath();
+      ctx.moveTo(0, WATER_Y + 6);
+      for (let x = 0; x <= W; x += 5) {
+        const island =
+          Math.max(0, Math.sin(x * 0.0042 + 1.2)) * 26 +
+          Math.max(0, Math.sin(x * 0.0089 + 4.0)) * 18;
+        const h = island + Math.sin(x * 0.19) * 2.5;
+        ctx.lineTo(x, WATER_Y + 6 - h);
+      }
+      ctx.lineTo(W, WATER_Y + 6);
+      ctx.closePath();
+      ctx.fill();
+
+      // mudflat waterline under the mid bank
+      ctx.fillStyle = C.mud;
+      ctx.globalAlpha = 0.55;
+      ctx.beginPath();
+      ctx.moveTo(0, WATER_Y + 6);
+      for (let x = 0; x <= W; x += 5) {
+        const island =
+          Math.max(0, Math.sin(x * 0.0042 + 1.2)) * 26 +
+          Math.max(0, Math.sin(x * 0.0089 + 4.0)) * 18;
+        ctx.lineTo(x, WATER_Y + 6 - Math.min(island, 5));
+      }
+      ctx.lineTo(W, WATER_Y + 10);
+      ctx.lineTo(0, WATER_Y + 10);
+      ctx.closePath();
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      // low ground mist sitting on the water — reads as marsh, not lake
+      ctx.fillStyle = C.fog;
+      ctx.globalAlpha = 0.1;
+      for (let i = 0; i < 3; i++) {
+        const y = WATER_Y - 18 + i * 14;
+        const drift = Math.sin(s.t / (2600 + i * 700) + i) * 40;
+        ctx.beginPath();
+        ctx.ellipse(W / 2 + drift, y, W * 0.62, 11 - i * 2, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+
+    } else if (P.id === "prairie") {
+      // Big empty sky country: a low grass horizon, rolling stubble, and
+      // absolutely nothing tall. The contrast with the bayou IS the point.
+      ctx.fillStyle = "#5A5335";
+      ctx.beginPath();
+      ctx.moveTo(0, WATER_Y);
+      for (let x = 0; x <= W; x += 7) {
+        const h = 10 + Math.sin(x * 0.013) * 6 + Math.sin(x * 0.061) * 3;
+        ctx.lineTo(x, WATER_Y - h);
+      }
+      ctx.lineTo(W, WATER_Y);
+      ctx.closePath();
+      ctx.fill();
+      // wind-bent grass along the bank
+      ctx.strokeStyle = "#6B6440";
+      ctx.lineWidth = 1.5;
+      for (let k = 0; k < 150; k++) {
+        const x = (k * 37) % W;
+        const h = 8 + ((k * 23) % 16);
+        const lean = 5 + Math.sin(s.t / 700 + k * 0.3) * 3; // steady prairie wind
+        ctx.beginPath();
+        ctx.moveTo(x, WATER_Y - 4);
+        ctx.quadraticCurveTo(x + lean * 0.5, WATER_Y - 4 - h * 0.6, x + lean, WATER_Y - 4 - h);
+        ctx.stroke();
+      }
+      // distant pothole ponds catching the light
+      ctx.fillStyle = P.accent;
+      ctx.globalAlpha = 0.15;
+      for (let k = 0; k < 5; k++) {
+        ctx.beginPath();
+        ctx.ellipse(90 + k * 190, WATER_Y - 16 + (k % 2) * 5, 46 - k * 4, 4, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      // a lone fencepost line — the only vertical thing out here
+      ctx.strokeStyle = "#3A3524";
+      ctx.lineWidth = 2;
+      for (let k = 0; k < 9; k++) {
+        const x = 60 + k * 104;
+        ctx.beginPath();
+        ctx.moveTo(x, WATER_Y - 6);
+        ctx.lineTo(x, WATER_Y - 26 + k * 0.8);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(60, WATER_Y - 22);
+      ctx.lineTo(60 + 8 * 104, WATER_Y - 15);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    } else if (P.id === "ridge") {
+      // Hardwood ridge: heavy oak trunks with a leaf canopy overhead.
+      // Vertical and enclosed, where the marsh is open and horizontal.
+      ctx.fillStyle = "#2A3326";
+      ctx.beginPath();
+      ctx.moveTo(0, WATER_Y);
+      for (let x = 0; x <= W; x += 8) {
+        const h = 26 + Math.sin(x * 0.011) * 12 + Math.sin(x * 0.05) * 5;
+        ctx.lineTo(x, WATER_Y - h);
+      }
+      ctx.lineTo(W, WATER_Y);
+      ctx.closePath();
+      ctx.fill();
+
+      // oak trunks, thick and straight
+      for (let k = 0; k < 11; k++) {
+        const x = 30 + k * 84 + ((k * 37) % 30);
+        const w = 9 + ((k * 13) % 9);
+        const top = 30 + ((k * 53) % 90);
+        ctx.fillStyle = k % 2 ? "#3A3226" : "#2E281E";
+        ctx.beginPath();
+        ctx.moveTo(x - w, WATER_Y - 6);
+        ctx.lineTo(x - w * 0.65, top);
+        ctx.lineTo(x + w * 0.65, top);
+        ctx.lineTo(x + w, WATER_Y - 6);
+        ctx.closePath();
+        ctx.fill();
+        // a couple of limbs
+        ctx.strokeStyle = k % 2 ? "#3A3226" : "#2E281E";
+        ctx.lineWidth = 4;
+        for (let b = 0; b < 2; b++) {
+          const by = top + 40 + b * 55;
+          const dir = (k + b) % 2 ? 1 : -1;
+          ctx.beginPath();
+          ctx.moveTo(x, by);
+          ctx.quadraticCurveTo(x + dir * 26, by - 12, x + dir * 48, by - 26);
+          ctx.stroke();
+        }
+      }
+
+      // canopy of turning oak leaves across the top
+      for (let k = 0; k < 90; k++) {
+        const cx = (k * 61) % W;
+        const cy = 14 + ((k * 43) % 120);
+        const tone = ["#6B5A2A", "#7E6430", "#4F4A24", "#8A6A36"][k % 4];
+        ctx.fillStyle = tone;
+        ctx.globalAlpha = 0.55;
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, 22 + (k % 4) * 7, 12 + (k % 3) * 5, k * 0.4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    } else {
+      // Frozen flats: snow bank, bare black scrub, and pressure cracks in
+      // the ice. Monochrome and cold — nothing here looks like the bayou.
+      ctx.fillStyle = "#DCE6EE";
+      ctx.beginPath();
+      ctx.moveTo(0, WATER_Y);
+      for (let x = 0; x <= W; x += 9) {
+        const h = 20 + Math.sin(x * 0.009) * 12 + Math.sin(x * 0.043) * 5;
+        ctx.lineTo(x, WATER_Y - h);
+      }
+      ctx.lineTo(W, WATER_Y);
+      ctx.closePath();
+      ctx.fill();
+      // blue shadow under the drift lip
+      ctx.fillStyle = "#A9BECE";
+      ctx.globalAlpha = 0.6;
+      ctx.beginPath();
+      ctx.moveTo(0, WATER_Y);
+      for (let x = 0; x <= W; x += 9) {
+        const h = 20 + Math.sin(x * 0.009) * 12 + Math.sin(x * 0.043) * 5;
+        ctx.lineTo(x, WATER_Y - Math.min(h, 6));
+      }
+      ctx.lineTo(W, WATER_Y);
+      ctx.closePath();
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      // bare scrub willows poking through the snow
+      ctx.strokeStyle = "#2B333B";
+      for (let k = 0; k < 26; k++) {
+        const x = (k * 71) % W;
+        const h = 14 + ((k * 29) % 30);
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x, WATER_Y - 12);
+        ctx.lineTo(x + 2, WATER_Y - 12 - h);
+        ctx.stroke();
+        ctx.lineWidth = 1;
+        for (let b = 0; b < 3; b++) {
+          const by = WATER_Y - 14 - h * (0.4 + b * 0.2);
+          const dir = b % 2 ? 1 : -1;
+          ctx.beginPath();
+          ctx.moveTo(x + 2, by);
+          ctx.lineTo(x + 2 + dir * (5 + b * 2), by - 6 - b * 2);
+          ctx.stroke();
+        }
+      }
+    }
+
+    // --- WATER (EVERY place) -------------------------------------
+    // This must run for all three. It used to live inside the bayou branch,
+    // so on prairie and tundra the bottom of the canvas was never repainted
+    // and the dog, gun and particles smeared across it.
+    const wat = ctx.createLinearGradient(0, WATER_Y, 0, H);
+    wat.addColorStop(0, P.water[0]);
+    wat.addColorStop(0.5, P.water[1]);
+    wat.addColorStop(1, P.water[2]);
+    ctx.fillStyle = wat;
+    ctx.fillRect(-20, WATER_Y, W + 40, H - WATER_Y + 20);
+
+    // --- IN-WATER DETAIL (per place) -----------------------------
+    if (P.id === "bayou") {
+      // submerged weed beds — dark blotches under the surface
+      ctx.fillStyle = "#1D2A26";
+      ctx.globalAlpha = 0.35;
+      for (let i = 0; i < 9; i++) {
+        const x = (i * 211) % W;
+        const y = WATER_Y + 22 + ((i * 67) % 110);
+        ctx.beginPath();
+        ctx.ellipse(x, y, 60 + ((i * 31) % 50), 9 + ((i * 13) % 7), 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+
+      // emergent grass poking through the shallows
+      ctx.strokeStyle = C.sedgeNear;
+      ctx.lineWidth = 2;
+      for (let i = 0; i < 34; i++) {
+        const x = (i * 173) % W;
+        const y = WATER_Y + 14 + ((i * 91) % 120);
+        const h = 12 + ((i * 29) % 20);
+        const sway = Math.sin(s.t / 1000 + i) * 3;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.quadraticCurveTo(x + sway, y - h * 0.6, x + sway * 2.2, y - h);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x + 4, y);
+        ctx.quadraticCurveTo(x + 4 + sway, y - h * 0.4, x + 8 + sway, y - h * 0.7);
+        ctx.stroke();
+      }
+
+      // middle and front cypress — drawn live so they sway, and short enough
+      // in front that they sit below the duck flight band
+      drawBand(ctx, BANDS[2], s.t, WATER_Y);
+      drawBand(ctx, BANDS[3], s.t, WATER_Y);
+
+      // cypress knees breaking the surface around their bases
+      ctx.fillStyle = C.cypressNear;
+      for (let i = 0; i < 30; i++) {
+        const bx = ((i * 137) % (W + 60)) - 30;
+        const by = WATER_Y + 24 + ((i * 43) % 110);
+        const kh = 6 + ((i * 19) % 12);
+        ctx.beginPath();
+        ctx.moveTo(bx - kh * 0.4, by);
+        ctx.quadraticCurveTo(bx - kh * 0.15, by - kh, bx, by - kh * 1.15);
+        ctx.quadraticCurveTo(bx + kh * 0.2, by - kh * 0.9, bx + kh * 0.45, by);
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalAlpha = 0.22;
+        ctx.strokeStyle = C.paper;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.ellipse(bx, by, kh * 0.9, kh * 0.22, 0, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = C.cypressNear;
+      }
+    } else if (P.id === "tundra") {
+      // pressure cracks across the black ice
+      ctx.strokeStyle = "#3E5060";
+      ctx.globalAlpha = 0.5;
+      ctx.lineWidth = 1.5;
+      for (let k = 0; k < 7; k++) {
+        let x = (k * 151) % W, y = WATER_Y + 20 + ((k * 47) % 110);
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        for (let seg = 0; seg < 5; seg++) {
+          x += 40 + Math.random() * 30;
+          y += (Math.random() - 0.5) * 18;
+          ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+      // drifting snow
+      ctx.fillStyle = "#FFFFFF";
+      ctx.globalAlpha = 0.5;
+      for (let k = 0; k < 70; k++) {
+        const sx = (k * 173 + s.t * 0.06 * (1 + (k % 3) * 0.4)) % (W + 40) - 20;
+        const sy = (k * 97 + s.t * 0.03) % H;
+        ctx.beginPath();
+        ctx.arc(sx, sy, 1 + (k % 3) * 0.7, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // shimmer
+    if (P.id === "ridge") {
+      // fallen leaves on the forest floor
+      for (let i = 0; i < 90; i++) {
+        const lx = (i * 97) % W;
+        const ly = WATER_Y + 8 + ((i * 53) % (H - WATER_Y - 10));
+        ctx.fillStyle = ["#5A4A24", "#6E5A2E", "#463A1E", "#7A6234"][i % 4];
+        ctx.globalAlpha = 0.6;
+        ctx.beginPath();
+        ctx.ellipse(lx, ly, 6, 3, (i % 7) * 0.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.strokeStyle = P.accent;
+    ctx.globalAlpha = P.id === "ridge" ? 0 : 0.13;
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 12; i++) {
+      const y = WATER_Y + 10 + i * 12;
+      const w = 120 - i * 6;
+      ctx.beginPath();
+      ctx.moveTo(P.sunX - w / 2 + Math.sin(s.t / 700 + i) * 12, y);
+      ctx.lineTo(P.sunX + w / 2 + Math.sin(s.t / 700 + i) * 12, y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // floating birds
+    for (const f of s.floats) {
+      const FT = DUCKS[f.t ?? 0];
+      const fade = f.life < 1800 ? 0.35 + 0.65 * Math.abs(Math.sin(s.t / 110)) : 1;
+      ctx.globalAlpha = fade;
+      ctx.fillStyle = FT.body;
+      ctx.beginPath();
+      ctx.ellipse(f.x, f.y + Math.sin(f.bob) * 2, 15 * FT.size, 7 * FT.size, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 0.3;
+      ctx.strokeStyle = C.paper;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.ellipse(f.x, f.y + 7, 24, 5, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // --- the flushing dog ----------------------------------------
+    if (s.flusher) {
+      const fl = s.flusher;
+      const working = fl.state !== "rest";
+      // reuse the dog silhouette, scaled down — a spaniel next to a lab
+      ctx.save();
+      ctx.translate(fl.x, fl.y);
+      ctx.scale(0.82, 0.82);
+      ctx.translate(-fl.x, -fl.y);
+      drawDog(
+        ctx,
+        { x: fl.x, y: fl.y, state: fl.dir >= 0 ? "out" : "back", gait: fl.gait, carried: [] },
+        "#6A4630", "#40291B", "#8C6242", s.t, working
+      );
+      ctx.restore();
+
+      // burst of brush and feathers where it just flushed
+      if (fl.puff > 0) {
+        const a = fl.puff / 420;
+        ctx.globalAlpha = a * 0.7;
+        ctx.strokeStyle = C.paper;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(fl.x, fl.y - 10, (1 - a) * FLUSHER[META.lvl.flusher ?? 0].radius, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // --- the buck (behind the birds, out on the bank) -------------
+    if (s.buck && !s.buck.out && s.buck.appearIn <= 0) {
+      drawBuck(ctx, s.buck, s.t);
+    }
+
+    // --- dogs ----------------------------------------------------
+    s.dogs.forEach((dog, di) => {
+      // first dog is a chesapeake, second a yellow lab
+      const coat     = di === 0 ? "#8C4A2A" : "#A8894E";
+      const coatDark = di === 0 ? "#5E2F1A" : "#775F33";
+      const coatLit  = di === 0 ? "#B06A42" : "#C9AA6E";
+      drawDog(ctx, dog, coat, coatDark, coatLit, s.t, dog.state !== "idle");
+    });
+
+    // --- hired hunter --------------------------------------------
+    // Drawn as a standing figure in profile: legs in the water, tapered
+    // torso, shoulders, neck, a capped head, and both arms on the gun.
+    if (s.h2) {
+      const h = s.h2;
+      const coat = "#232C22";
+      const coatLit = "#39452F";
+      const trouser = "#1A211B";
+      const skin = "#8A6A4E";
+      const kick = h.recoil;
+      const lean = kick * 3; // rocks back on the shot
+
+      ctx.save();
+      ctx.translate(h.x + lean, h.y);
+
+      // --- legs, disappearing into the water
+      ctx.strokeStyle = trouser;
+      ctx.lineWidth = 7;
+      ctx.lineCap = "round";
+      ctx.beginPath();          // back leg
+      ctx.moveTo(-2, 16);
+      ctx.lineTo(-9, 40);
+      ctx.stroke();
+      ctx.beginPath();          // front leg, slightly braced forward
+      ctx.moveTo(3, 16);
+      ctx.lineTo(9, 39);
+      ctx.stroke();
+
+      // --- torso: wide at the shoulders, narrow at the waist
+      ctx.fillStyle = coat;
+      ctx.beginPath();
+      ctx.moveTo(-11, -9);      // back shoulder
+      ctx.quadraticCurveTo(-13, 2, -7, 18);
+      ctx.lineTo(8, 18);
+      ctx.quadraticCurveTo(12, 2, 10, -9);
+      ctx.quadraticCurveTo(0, -14, -11, -9);
+      ctx.closePath();
+      ctx.fill();
+
+      // shoulder line catching the light
+      ctx.strokeStyle = coatLit;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(-10, -9);
+      ctx.quadraticCurveTo(0, -13, 9, -9);
+      ctx.stroke();
+
+      // --- neck and head
+      ctx.fillStyle = skin;
+      ctx.fillRect(0, -20, 5, 8);
+      ctx.beginPath();
+      ctx.ellipse(3, -25, 7, 7.5, 0.12, 0, Math.PI * 2);
+      ctx.fill();
+      // jaw shadow so the head reads as facing right
+      ctx.fillStyle = "#6E5340";
+      ctx.beginPath();
+      ctx.ellipse(6, -22, 3.5, 3, 0.3, 0, Math.PI * 2);
+      ctx.fill();
+
+      // --- cap with a forward brim
+      ctx.fillStyle = "#161C15";
+      ctx.beginPath();
+      ctx.ellipse(2, -30, 8, 5.5, 0.05, Math.PI, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();          // brim
+      ctx.ellipse(11, -29, 7, 2.2, 0.08, 0, Math.PI * 2);
+      ctx.fill();
+
+      // --- back arm, bent to the trigger
+      ctx.strokeStyle = coat;
+      ctx.lineWidth = 6;
+      ctx.beginPath();
+      ctx.moveTo(-6, -5);
+      ctx.quadraticCurveTo(-10, 3, -3, 6);
+      ctx.stroke();
+
+      // --- gun and forward arm, both rotating with the aim
+      ctx.save();
+      ctx.rotate(h.ang + kick * 0.16);
+      ctx.translate(-kick * 8, 0);
+
+      ctx.strokeStyle = "#A87A4E";   // stock
+      ctx.lineWidth = 6;
+      ctx.beginPath();
+      ctx.moveTo(-30, -6);
+      ctx.lineTo(-8, -8);
+      ctx.stroke();
+
+      ctx.strokeStyle = "#2A333B";   // barrel
+      ctx.lineWidth = 5;
+      ctx.beginPath();
+      ctx.moveTo(-14, -8);
+      ctx.lineTo(74, -8);
+      ctx.stroke();
+
+      // forward arm reaching along the forend — this is what sells "holding"
+      ctx.strokeStyle = coat;
+      ctx.lineWidth = 6;
+      ctx.beginPath();
+      ctx.moveTo(2, 2);
+      ctx.quadraticCurveTo(18, 4, 30, -4);
+      ctx.stroke();
+      ctx.fillStyle = skin;          // hand on the forend
+      ctx.beginPath();
+      ctx.arc(32, -5, 3.4, 0, Math.PI * 2);
+      ctx.fill();
+
+      if (h.muzzle > 0) {
+        const a = h.muzzle / 120;
+        ctx.globalAlpha = a;
+        ctx.fillStyle = C.paper;
+        ctx.beginPath();
+        ctx.moveTo(74, -8);
+        ctx.lineTo(74 + 30 * a, -8 - 12 * a);
+        ctx.lineTo(74 + 42 * a, -8);
+        ctx.lineTo(74 + 30 * a, -8 + 12 * a);
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+      ctx.restore();
+
+      ctx.lineCap = "butt";
+      ctx.restore();
+
+      // ripple where he's standing in the water
+      ctx.strokeStyle = C.paper;
+      ctx.globalAlpha = 0.18;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.ellipse(h.x, h.y + 38, 17, 4, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // ducks
+    for (const d of s.ducks) {
+      const T = DUCKS[d.t ?? 0];
+      const face = d.vx > 0 ? 1 : -1;
+      const z = T.size;
+      ctx.save();
+      ctx.translate(d.x, d.y);
+      ctx.scale(face * z, z);
+      if (!d.alive) ctx.rotate(0.7);
+
+      // turkeys are drawn from scratch — nothing about a duck body fits
+      if (T.ground) {
+        drawTurkey(ctx, d, T);
+        ctx.restore();
+        continue;
+      }
+
+      // long tail feathers (pintail)
+      if (T.tail) {
+        ctx.strokeStyle = T.body;
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(-16, 0);
+        ctx.lineTo(-16 - T.tail, d.alive ? -3 : 2);
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = T.body;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, 19, 10, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // head
+      ctx.fillStyle = T.head;
+      ctx.beginPath();
+      ctx.ellipse(15, -9, 8, 7, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // species marking
+      if (T.mark) {
+        ctx.fillStyle = T.mark;
+        if (T.name === "Teal") {
+          // facial crescent
+          ctx.beginPath();
+          ctx.ellipse(17, -10, 2.4, 4, 0.3, 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          // neck stripe
+          ctx.fillRect(9, -10, 2.5, 9);
+        }
+      }
+
+      // bill
+      ctx.beginPath();
+      ctx.moveTo(21, -9);
+      ctx.lineTo(31, -6);
+      ctx.lineTo(21, -3);
+      ctx.closePath();
+      ctx.fillStyle = T.bill;
+      ctx.fill();
+
+      // wing
+      ctx.fillStyle = "#1E2A36";
+      const flap = d.alive ? Math.sin(d.wing) * 14 : 10;
+      ctx.beginPath();
+      ctx.ellipse(-3, -4 - flap * 0.4, 13, 6, -flap * 0.05, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // particles
+    for (const p of s.parts) {
+      const a = p.life / p.max;
+      ctx.globalAlpha = clamp(a, 0, 1);
+      if (p.kind === "feather") {
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.rotate(p.rot);
+        ctx.fillStyle = C.paper;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, 5, 2, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      } else if (p.kind === "shell") {
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.rotate(p.rot);
+        ctx.fillStyle = "#B8863A";
+        ctx.fillRect(-6, -2.5, 12, 5);
+        ctx.fillStyle = "#8C1F1F";
+        ctx.fillRect(-6, -2.5, 4.5, 5);
+        ctx.restore();
+      } else if (p.kind === "splash") {
+        ctx.fillStyle = C.waterLit;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 3 * a + 1, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.fillStyle = C.fog;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 6 * (1 - a) + 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // --- FOREGROUND (per place) ----------------------------------
+    if (P.id === "bayou") {
+      // foreground cattails — the frame that sells "marsh"
+      for (let i = 0; i < 40; i++) {
+        const x = (i * 47) % (W + 40) - 20;
+        const near = i % 3 === 0;
+        const h = (near ? 95 : 58) + ((i * 37) % 70);
+        const sway = Math.sin(s.t / 900 + i * 0.7) * (near ? 8 : 5);
+        ctx.strokeStyle = near ? C.sedgeNear : C.reed;
+        ctx.lineWidth = near ? 4 : 2.5;
+        // stalk
+        ctx.beginPath();
+        ctx.moveTo(x, H + 6);
+        ctx.quadraticCurveTo(x + sway, H - h * 0.55, x + sway * 2, H - h);
+        ctx.stroke();
+        // seed head on some
+        if (i % 4 === 0) {
+          ctx.fillStyle = C.cattail;
+          ctx.beginPath();
+          ctx.ellipse(x + sway * 2, H - h - 9, near ? 4.5 : 3.5, near ? 15 : 11, sway * 0.02, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = near ? C.sedgeNear : C.reed;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(x + sway * 2, H - h - 24);
+          ctx.lineTo(x + sway * 2 + 1, H - h - 34);
+          ctx.stroke();
+        } else {
+          // arching blade
+          ctx.lineWidth = near ? 3 : 2;
+          ctx.beginPath();
+          ctx.moveTo(x + sway * 2, H - h);
+          ctx.quadraticCurveTo(x + sway * 2 + 16, H - h - 12, x + sway * 2 + 34, H - h + 10);
+          ctx.stroke();
+        }
+      }
+    } else if (P.id === "ridge") {
+      // low brush and saplings framing the bottom
+      for (let k = 0; k < 46; k++) {
+        const x = (k * 41) % (W + 30) - 15;
+        const h = 34 + ((k * 47) % 66);
+        const sway = Math.sin(s.t / 1100 + k) * 3;
+        ctx.strokeStyle = k % 3 === 0 ? "#1E2418" : "#2A3222";
+        ctx.lineWidth = k % 3 === 0 ? 4 : 2.4;
+        ctx.beginPath();
+        ctx.moveTo(x, H + 6);
+        ctx.quadraticCurveTo(x + sway, H - h * 0.5, x + sway * 2, H - h);
+        ctx.stroke();
+        ctx.fillStyle = "#4A4A28";
+        for (let lf = 0; lf < 3; lf++) {
+          ctx.beginPath();
+          ctx.ellipse(x + sway * 2 + (lf - 1) * 7, H - h + lf * 9, 6, 3.4, lf * 0.7, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    } else if (P.id === "prairie") {
+      ctx.strokeStyle = "#2E2A18";
+      for (let k = 0; k < 70; k++) {
+        const x = (k * 29) % (W + 30) - 15;
+        const h = 40 + ((k * 41) % 70);
+        const lean = 12 + Math.sin(s.t / 640 + k * 0.4) * 7;
+        ctx.lineWidth = k % 3 === 0 ? 3 : 1.8;
+        ctx.beginPath();
+        ctx.moveTo(x, H + 6);
+        ctx.quadraticCurveTo(x + lean * 0.4, H - h * 0.55, x + lean, H - h);
+        ctx.stroke();
+        if (k % 5 === 0) {
+          ctx.fillStyle = "#4A4228";
+          ctx.beginPath();
+          ctx.ellipse(x + lean, H - h - 4, 2.5, 7, lean * 0.02, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    } else {
+      // snow ridge across the bottom, with a few frozen stalks
+      ctx.fillStyle = "#E8F0F6";
+      ctx.beginPath();
+      ctx.moveTo(0, H + 10);
+      for (let x = 0; x <= W; x += 12) {
+        ctx.lineTo(x, H - 26 - Math.sin(x * 0.011) * 14 - Math.sin(x * 0.05) * 5);
+      }
+      ctx.lineTo(W, H + 10);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = "#33414D";
+      ctx.lineWidth = 2;
+      for (let k = 0; k < 22; k++) {
+        const x = (k * 83) % W;
+        const h = 26 + ((k * 37) % 40);
+        const lean = Math.sin(s.t / 900 + k) * 3;
+        ctx.beginPath();
+        ctx.moveTo(x, H - 30);
+        ctx.quadraticCurveTo(x + lean, H - 30 - h * 0.6, x + lean * 1.8, H - 30 - h);
+        ctx.stroke();
+      }
+    }
+
+    // buck payout, floating up from where he dropped
+    if (s.buckFlash) {
+      const a = clamp(s.buckFlash.life / 1500, 0, 1);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = C.amber;
+      ctx.font = "bold 26px Georgia, serif";
+      ctx.textAlign = "center";
+      ctx.fillText(`+$${s.buckFlash.paid}`, s.buckFlash.x, s.buckFlash.y - 60 - (1 - a) * 40);
+      ctx.font = "12px ui-monospace, Menlo, monospace";
+      ctx.fillText("BUCK DOWN", s.buckFlash.x, s.buckFlash.y - 40 - (1 - a) * 40);
+      ctx.textAlign = "left";
+      ctx.globalAlpha = 1;
+    }
+
+    // multi-kill marker
+    if (s.multi) {
+      const a = clamp(s.multi.life / 950, 0, 1);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = C.paper;
+      ctx.font = "bold 20px Georgia, serif";
+      ctx.textAlign = "center";
+      ctx.fillText(`×${s.multi.n}`, s.multi.x, s.multi.y - 34 - (1 - a) * 26);
+      ctx.textAlign = "left";
+      ctx.globalAlpha = 1;
+    }
+
+    // the gun, in front of everything in the scene
+    {
+      const total = reloadFor(META);
+      const prog = s.shells <= 0
+        ? clamp(1 - (s.reloadUntil - performance.now()) / total, 0, 1)
+        : 0;
+      drawGun(ctx, s, prog, weaponOf(META), skinOf(META));
+    }
+
+    // reload ring — put the state where the eye already is, not in a corner
+    if (s.shells <= 0 && s.aim) {
+      const total = reloadFor(META);
+      const prog = clamp(1 - (s.reloadUntil - performance.now()) / total, 0, 1);
+      ctx.strokeStyle = "#2E4658";
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(s.aim.x, s.aim.y, 26, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.strokeStyle = C.amber;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.arc(s.aim.x, s.aim.y, 26, -Math.PI / 2, -Math.PI / 2 + prog * Math.PI * 2);
+      ctx.stroke();
+      ctx.lineCap = "butt";
+    }
+
+    // refill pop — the "chunk" moment
+    if (s.refill > 0 && s.aim) {
+      const a = s.refill / 320;
+      ctx.globalAlpha = a;
+      ctx.strokeStyle = C.paper;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(s.aim.x, s.aim.y, 26 + (1 - a) * 24, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // dry click
+    if (s.dry) {
+      const a = s.dry.life / 220;
+      const r = 9 + (1 - a) * 6;
+      ctx.globalAlpha = a * 0.85;
+      ctx.strokeStyle = "#8FA2B2";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(s.dry.x - r, s.dry.y - r); ctx.lineTo(s.dry.x + r, s.dry.y + r);
+      ctx.moveTo(s.dry.x + r, s.dry.y - r); ctx.lineTo(s.dry.x - r, s.dry.y + r);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // muzzle flash
+    if (s.flash) {
+      const a = s.flash.life / 120;
+      ctx.globalAlpha = a * 0.9;
+      ctx.fillStyle = C.paper;
+      ctx.beginPath();
+      ctx.arc(s.flash.x, s.flash.y, 26 * (1 - a) + 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = a * 0.5;
+      ctx.strokeStyle = C.amber;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(s.flash.x, s.flash.y, 34 * (1 - a) + 10, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.restore();
+  }
+
+</script>
+
+<script>
+/* ------------------------------------------------------------------
+   Vanilla UI controller.
+
+   Manifest V3 forbids remote code, so the extension can't load React from
+   a CDN. The game core (simulation + canvas rendering) is unchanged; only
+   the menus and HUD are rebuilt here as plain DOM.
+------------------------------------------------------------------ */
+
+let META = newGame();
+let G = null;
+let BG = null;
+let REDUCED = false;
+let RAF = 0;
+let CANVAS = null;
+let CTX = null;
+let DPR = 1;
+let SUMMARY = null;
+let SCREEN = "title";
+let SAVED = null;
+let CODE = "";
+let CODE_NOTE = "";
+
+const el = (tag, style, text) => {
+  const n = document.createElement(tag);
+  if (style) Object.assign(n.style, style);
+  if (text !== undefined) n.textContent = text;
+  return n;
+};
+
+const MONO = "ui-monospace, 'SF Mono', Menlo, monospace";
+
+/* Phone browsers get a much tighter layout: the chrome that looks
+   comfortable on a laptop eats most of a 380px screen. */
+const isNarrow = () => (window.innerWidth || 900) < 640;
+const isPortrait = () =>
+  (window.innerHeight || 560) > (window.innerWidth || 900);
+const sz = (big, small) => (isNarrow() ? small : big);
+const SERIF = "Georgia, 'Iowan Old Style', serif";
+
+const btnStyle = (variant) => ({
+  background: variant === "ghost" ? "transparent" : C.amber,
+  color: variant === "ghost" ? "#9DAEBC" : "#1A1207",
+  border: variant === "ghost" ? "1px solid #2B3D4E" : "none",
+  padding: sz("12px 22px", "13px 18px"),
+  minHeight: "46px",
+  fontSize: sz("14px", "13px"),
+  letterSpacing: "0.14em",
+  textTransform: "uppercase",
+  fontFamily: MONO,
+  cursor: "pointer",
+  borderRadius: "2px",
+  fontWeight: variant === "ghost" ? "400" : "700",
+});
+
+const rowStyle = {
+  display: "flex",
+  justifyContent: "space-between",
+  alignItems: "center",
+  padding: "13px 0",
+  borderBottom: "1px solid #1E2E3E",
+  gap: "12px",
+};
+
+/* ---------------- persistence ---------------- */
+
+persist = async function () {
+  const ok = await Save.write(META);
+  SAVED = await Save.load();
+  UI.note(ok ? "Saved" : "Saved for this session");
+};
+
+/* ---------------- the UI object the core calls ---------------- */
+
+UI = {
+  noteTimer: 0,
+
+  note(text) {
+    const n = document.getElementById("saveNote");
+    if (!n) return;
+    n.textContent = text;
+    clearTimeout(this.noteTimer);
+    this.noteTimer = setTimeout(() => { n.textContent = ""; }, 2200);
+  },
+
+  wallet() {
+    const w = document.getElementById("wallet");
+    if (w) w.textContent = `$${META.money}`;
+    const g = document.getElementById("shells");
+    if (g) g.textContent = `◆${META.gb || 0}`;
+  },
+
+  results(data) {
+    SUMMARY = data;
+  },
+
+  show(name) {
+    SCREEN = name;
+    render();
+  },
+};
+
+/* ---------------- game loop ---------------- */
+
+function startLoop() {
+  cancelAnimationFrame(RAF);
+  let last = performance.now();
+  const tick = (now) => {
+    RAF = requestAnimationFrame(tick);
+    const dt = Math.min(Math.max(now - last, 0), 50);
+    last = now;
+    try {
+      if (!CTX) return;                 // canvas not ready yet this frame
+      if (G && G.paused) {
+        if (G.shells <= 0 && G.reloadUntil > 0) G.reloadUntil += dt;
+        draw(CTX);
+      } else {
+        step(dt);
+        draw(CTX);
+      }
+    } catch (err) {
+      console.error("Frame error:", err);
+    }
+    if (G && G.over) {
+      cancelAnimationFrame(RAF);
+      persist();
+      if (SUMMARY && SUMMARY.isBest) Sound.best(); else Sound.cash();
+    }
+    syncHud();
+  };
+  RAF = requestAnimationFrame(tick);
+}
+
+function syncHud() {
+  if (SCREEN !== "playing" || !G) return;
+  const shellsEl = document.getElementById("hudShells");
+  const bagEl = document.getElementById("hudBag");
+  const timeEl = document.getElementById("hudTime");
+  if (!shellsEl) return;
+  const cap = GUN[META.lvl.gun].shells;
+  let pips = "";
+  for (let i = 0; i < Math.min(cap, 14); i++) pips += i < G.shells ? "▮" : "▯";
+  shellsEl.textContent = pips + (G.shells <= 0 ? "  RELOADING" : "");
+  shellsEl.style.color = G.shells <= 0 ? C.rust : C.amber;
+  bagEl.textContent = `BAG ${G.bagged}/${BAG[META.lvl.bag].cap}`;
+  const secs = Math.max(0, Math.ceil(G.time / 1000));
+  timeEl.textContent = `${secs}s`;
+  timeEl.style.color = secs <= 10 ? C.rust : C.paper;
+}
+
+function startRound() {
+  G = newRound(META);
+  SCREEN = "playing";
+  render();                 // attaches the persistent canvas
+  initCanvasBitmap();       // size it and take a context
+
+  // Pre-render the static back bands once per round (bayou only).
+  const bg = document.createElement("canvas");
+  bg.width = W * DPR;
+  bg.height = H * DPR;
+  const bctx = bg.getContext("2d");
+  bctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if ((META.place ?? 0) === 0) {
+    drawBand(bctx, BANDS[0], 0, WATER_Y);
+    drawBand(bctx, BANDS[1], 0, WATER_Y);
+  }
+  BG = bg;
+
+  startLoop();
+}
+
+function setPause(v) {
+  if (!G || G.over) return;
+  G.paused = v;
+  render();
+}
+
+/* ---------------- screens ---------------- */
+
+function render() {
+  const root = document.getElementById("root");
+  root.innerHTML = "";
+
+  const landscapePlay = (window.innerHeight || 560) <= 500 &&
+                        (window.innerWidth || 900) > (window.innerHeight || 560) &&
+                        SCREEN === "playing";
+
+  const shell = el("div", {
+    minHeight: "100%", display: "flex", alignItems: "center",
+    justifyContent: "center",
+    padding: landscapePlay ? "2px" : sz("16px", "8px"),
+    paddingBottom: sz("16px", "max(8px, env(safe-area-inset-bottom))"),
+    boxSizing: "border-box",
+  });
+  const wrap = el("div", { width: "100%", maxWidth: "900px" });
+
+  // header
+  const landscapePhone = (window.innerHeight || 560) <= 500 &&
+                         (window.innerWidth || 900) > (window.innerHeight || 560);
+
+  const head = el("div", {
+    display: "flex", justifyContent: "space-between",
+    alignItems: "baseline", marginBottom: sz("10px", "6px"),
+    gap: sz("12px", "8px"), flexWrap: "wrap",
+  });
+  const titleBox = el("div");
+  titleBox.appendChild(el("div", {
+    fontSize: sz("22px", "16px"), letterSpacing: sz("0.3em", "0.18em"),
+    textTransform: "uppercase", color: C.paper, fontFamily: SERIF,
+  }, "Limit Out"));
+  if (!isNarrow()) {
+    titleBox.appendChild(el("div", {
+      fontFamily: MONO, fontSize: "10px", letterSpacing: "0.22em",
+      color: "#5E7080", marginTop: "3px",
+    }, "DUCK HUNTING ARCADE"));
+  }
+  head.appendChild(titleBox);
+
+  const meta = el("div", {
+    fontFamily: MONO, fontSize: sz("13px", "12px"), color: C.amber,
+    display: "flex", alignItems: "center", gap: sz("10px", "7px"),
+    flexWrap: "wrap",
+  });
+  const note = el("span", { color: "#6E8496" });
+  note.id = "saveNote";
+  meta.appendChild(note);
+  const where = el("span", {
+    color: window.storageInfo && window.storageInfo.mode === "account" ? "#7FA88C" : "#5E7080",
+    fontSize: "11px",
+  }, window.storageInfo ? (window.storageInfo.mode === "account" ? "☁ account" : "▪ device") : "");
+  where.title = window.storageInfo ? window.storageInfo.label() : "";
+  meta.appendChild(where);
+  const wallet = el("span", {}, `$${META.money}`);
+  wallet.id = "wallet";
+  meta.appendChild(wallet);
+  const shells = el("span", { color: "#C9A227" }, `◆${META.gb || 0}`);
+  shells.id = "shells";
+  meta.appendChild(shells);
+  meta.appendChild(el("span", { color: "#5E7080" }, `Round ${META.round}`));
+  const mute = el("button", {
+    background: "transparent", border: "1px solid #2B3D4E", borderRadius: "2px",
+    color: Sound.muted ? "#5E7080" : C.amber, cursor: "pointer",
+    fontFamily: MONO, fontSize: "12px", padding: "4px 9px",
+  }, Sound.muted ? "♪ off" : "♪ on");
+  mute.onclick = () => {
+    Sound.resume();
+    Sound.setMuted(!Sound.muted);
+    STORE.set("limitout:muted", Sound.muted ? "1" : "0");
+    render();
+  };
+  meta.appendChild(mute);
+  head.appendChild(meta);
+  // in landscape the in-canvas HUD already shows everything that matters
+  if (!(landscapePhone && SCREEN === "playing")) wrap.appendChild(head);
+
+  wrap.appendChild(screenFor(SCREEN));
+  shell.appendChild(wrap);
+  root.appendChild(shell);
+}
+
+function panel(children) {
+  const p = el("div", {
+    border: "1px solid #26374A", background: "rgba(20,31,46,0.6)",
+    padding: sz("26px 24px", "16px 14px"), borderRadius: "3px",
+    color: C.paper, fontFamily: SERIF,
+    maxHeight: isNarrow() ? "82dvh" : "none",
+    overflowY: isNarrow() ? "auto" : "visible",
+    WebkitOverflowScrolling: "touch",
+  });
+  children.forEach((c) => p.appendChild(c));
+  return p;
+}
+
+function heading(text) {
+  return el("div", {
+    fontFamily: MONO, fontSize: "12px", letterSpacing: "0.2em",
+    color: C.amber, margin: "22px 0 6px",
+  }, text);
+}
+
+function screenFor(name) {
+  if (name === "title") return titleScreen();
+  if (name === "naming") return namingScreen();
+  if (name === "brief") return briefScreen();
+  if (name === "shop") return shopScreen();
+  if (name === "results") return resultsScreen();
+  return playScreen();
+}
+
+function titleScreen() {
+  const kids = [];
+  kids.push(el("p", {
+    lineHeight: "1.65", fontSize: "16px", margin: "0 0 20px", color: C.paper,
+  }, "Dawn on the marsh. Tap a duck to shoot it — but you only carry a few shells, and reloading costs you time. Your dog fetches what falls, and a bird left floating too long is gone. Fill the bag, sell the take, buy better gear."));
+
+  const bar = el("div", { display: "flex", gap: "10px", flexWrap: "wrap" });
+  if (SAVED) {
+    const card = el("div", {
+      border: "1px solid #2B3D4E", padding: "11px 13px", marginBottom: "14px",
+      fontFamily: MONO, fontSize: "13px", color: "#9DAEBC",
+    }, `${SAVED.hunter} & ${SAVED.dogName} · Round ${SAVED.round} · $${SAVED.money}${SAVED.best ? ` · best ${SAVED.best}` : ""}`);
+    kids.push(card);
+    const cont = el("button", btnStyle(), "Continue");
+    cont.onclick = () => {
+      loadInto(SAVED);
+      UI.show("brief");
+    };
+    bar.appendChild(cont);
+    const fresh = el("button", btnStyle("ghost"), "New hunt");
+    fresh.onclick = async () => {
+      await Save.clear();
+      META = newGame();
+      SAVED = null;
+      UI.show("title");
+    };
+    bar.appendChild(fresh);
+  } else {
+    const begin = el("button", btnStyle(), "Begin");
+    begin.onclick = () => UI.show("naming");
+    bar.appendChild(begin);
+  }
+  kids.push(bar);
+  kids.push(transferPanel());
+  return panel(kids);
+}
+
+function namingScreen() {
+  const kids = [];
+  kids.push(el("div", {
+    fontFamily: MONO, fontSize: "12px", letterSpacing: "0.2em",
+    color: C.amber, marginBottom: "18px",
+  }, "BEFORE FIRST LIGHT"));
+
+  const field = (label, value, onInput) => {
+    const box = el("div", { marginBottom: "16px" });
+    box.appendChild(el("div", {
+      fontFamily: MONO, fontSize: "11px", letterSpacing: "0.16em",
+      color: "#7C8B9A", marginBottom: "6px",
+    }, label));
+    const inp = el("input");
+    Object.assign(inp.style, {
+      width: "100%", boxSizing: "border-box", background: "#0E1822",
+      border: "1px solid #2B3D4E", color: C.paper, padding: "11px 13px",
+      fontSize: "16px", fontFamily: SERIF, borderRadius: "2px", outline: "none",
+    });
+    inp.value = value;
+    inp.maxLength = 16;
+    inp.oninput = (e) => onInput(e.target.value);
+    box.appendChild(inp);
+    return box;
+  };
+
+  let h = META.hunter, d = META.dogName;
+  kids.push(field("YOUR NAME", h, (v) => { h = v; }));
+  kids.push(field("YOUR DOG'S NAME", d, (v) => { d = v; }));
+  kids.push(el("p", {
+    fontSize: "14px", color: "#7C8B9A", lineHeight: "1.6", margin: "6px 0 20px",
+  }, "A good retriever is half the hunt. Pick a name you'll be shouting across the water for a long while."));
+
+  const bar = el("div", { display: "flex", gap: "10px" });
+  const go = el("button", btnStyle(), "Head out");
+  go.onclick = () => {
+    META.hunter = (h.trim() || "Hunter").slice(0, 16);
+    META.dogName = (d.trim() || "Scout").slice(0, 16);
+    persist();
+    UI.show("brief");
+  };
+  bar.appendChild(go);
+  const back = el("button", btnStyle("ghost"), "Back");
+  back.onclick = () => UI.show("title");
+  bar.appendChild(back);
+  kids.push(bar);
+  return panel(kids);
+}
+
+function briefScreen() {
+  const kids = [];
+  kids.push(el("div", { fontSize: "19px", marginBottom: "6px" },
+    `${META.hunter} & ${META.dogName}`));
+  kids.push(el("div", {
+    fontFamily: MONO, fontSize: "13px", color: "#7C8B9A", marginBottom: "6px",
+  }, `Round ${META.round} · $${META.money}${META.best ? ` · best bag ${META.best}` : ""}`));
+  kids.push(el("div", {
+    fontFamily: MONO, fontSize: "12px", color: PLACES[META.place].accent, marginBottom: "4px",
+  }, PLACES[META.place].name));
+  kids.push(el("div", {
+    fontFamily: MONO, fontSize: "11px", color: "#6E8496", marginBottom: "16px",
+  }, [
+    `bag ${BAG[META.lvl.bag].cap}`,
+    `${PELLET[META.lvl.pellet].birds}/shell`,
+    (WEAPONS.find((w) => w.id === (META.weapon || "pump")) || WEAPONS[0]).name,
+    META.hired.dog2 ? "2 dogs" : "1 dog",
+    META.hired.hunter2 ? "+ hired gun" : null,
+  ].filter(Boolean).join(" · ")));
+
+  kids.push(heading("ON THE WING"));
+  DUCKS.forEach((d, i) => {
+    const offered = META.round >= d.unlock;
+    const own = META.ducks[i];
+    const row = el("div", { ...rowStyle, opacity: own ? "1" : offered ? "0.75" : "0.42" });
+    const left = el("div", { display: "flex", alignItems: "center", gap: "10px" });
+    left.appendChild(el("span", {
+      width: "16px", height: "10px", borderRadius: "50%",
+      background: own ? d.body : "#1E2E3E",
+      border: `1px solid ${own ? d.head : "#2B3D4E"}`,
+      display: "inline-block", flexShrink: "0",
+    }));
+    const info = el("div");
+    info.appendChild(el("div", { fontSize: "15px" }, offered ? d.name : "????"));
+    info.appendChild(el("div", {
+      fontFamily: MONO, fontSize: "11px", color: "#7C8B9A", marginTop: "2px",
+    }, own ? d.note : offered ? `Available in the Outfitter — $${d.cost}` : `Offered at round ${d.unlock}`));
+    left.appendChild(info);
+    row.appendChild(left);
+    row.appendChild(el("div", {
+      fontFamily: MONO, fontSize: "13px", color: own ? C.amber : "#4A5766",
+    }, own ? `$${d.value}` : offered ? "not owned" : "—"));
+    kids.push(row);
+  });
+
+  const bar = el("div", { display: "flex", gap: "10px", flexWrap: "wrap", marginTop: "20px" });
+  const go = el("button", btnStyle(), "Start round");
+  go.onclick = () => startRound();
+  bar.appendChild(go);
+  const shop = el("button", btnStyle("ghost"), "Outfitter");
+  shop.onclick = () => UI.show("shop");
+  bar.appendChild(shop);
+  const save = el("button", btnStyle("ghost"), "Save");
+  save.onclick = () => persist();
+  bar.appendChild(save);
+  const home = el("button", btnStyle("ghost"), "Title");
+  home.onclick = () => UI.show("title");
+  bar.appendChild(home);
+  kids.push(bar);
+  kids.push(transferPanel());
+  return panel(kids);
+}
+
+function upgradeRow(key, table, title, detail) {
+  const lvl = META.lvl[key] ?? 0;
+  const maxed = lvl >= table.length - 1;
+  const price = maxed ? null : COST[key][lvl + 1];
+  const afford = !maxed && META.money >= price;
+
+  const row = el("div", rowStyle);
+  const left = el("div");
+  const t = el("div", { fontSize: "16px" }, title + " ");
+  t.appendChild(el("span", { color: "#5E7080", fontSize: "13px" }, `· ${table[lvl].name}`));
+  left.appendChild(t);
+  const d = el("div", {
+    fontFamily: MONO, fontSize: "12px", color: "#7C8B9A", marginTop: "4px",
+  }, detail(lvl));
+  if (!maxed) {
+    d.appendChild(el("span", { color: C.amber }, ` → ${detail(lvl + 1)}`));
+  }
+  left.appendChild(d);
+  row.appendChild(left);
+
+  const b = el("button", {
+    fontFamily: MONO, fontSize: "13px", padding: "9px 15px", borderRadius: "2px",
+    whiteSpace: "nowrap",
+    background: afford ? C.amber : "transparent",
+    color: maxed ? "#4A5766" : afford ? "#1A1207" : "#5E7080",
+    border: afford ? "none" : "1px solid #2B3D4E",
+    cursor: afford ? "pointer" : "default",
+    fontWeight: afford ? "700" : "400",
+  }, maxed ? "MAX" : `$${price}`);
+  if (afford) {
+    b.onclick = () => {
+      META.money -= price;
+      META.lvl[key] = lvl + 1;
+      persist();
+      render();
+    };
+  }
+  row.appendChild(b);
+  return row;
+}
+
+function shopScreen() {
+  const kids = [];
+  kids.push(el("div", {
+    fontFamily: MONO, fontSize: "12px", letterSpacing: "0.2em",
+    color: C.amber, marginBottom: "10px",
+  }, `OUTFITTER · $${META.money} · ◆${META.gb || 0} gold shells`));
+
+  TRACKS.forEach((t) => kids.push(upgradeRow(t.key, t.table, t.title, t.detail)));
+
+  /* ---- ARMORY: guns bought with gold shells ---- */
+  kids.push(heading("ARMORY · ◆" + (META.gb || 0)));
+  kids.push(el("div", {
+    fontSize: "13px", color: "#7C8B9A", marginBottom: "6px", lineHeight: "1.5",
+  }, "Bought with gold shells. A new gun bends your existing tier rather than replacing it, so nothing you've already bought goes to waste."));
+
+  WEAPONS.forEach((w) => {
+    const owned = (META.weapons || ["pump"]).includes(w.id);
+    const equipped = (META.weapon || "pump") === w.id;
+    const afford = !owned && (META.gb || 0) >= w.gb;
+    const row = el("div", rowStyle);
+    const left = el("div");
+    left.appendChild(el("div", { fontSize: "16px" },
+      w.name + (equipped ? " · equipped" : "")));
+    const d = el("div", {
+      fontFamily: MONO, fontSize: "11px", color: "#7C8B9A",
+      marginTop: "4px", lineHeight: "1.5",
+    }, w.blurb);
+    left.appendChild(d);
+    const stats = [
+      "shells " + (w.shellMul > 1 ? "+" : "") + Math.round((w.shellMul - 1) * 100) + "%",
+      "reload " + (w.reloadMul < 1 ? "+" : "") + Math.round((1 - w.reloadMul) * 100) + "%",
+      "spread " + Math.round((w.spreadMul - 1) * 100) + "%",
+      "value " + (w.valueMul > 1 ? "+" : "") + Math.round((w.valueMul - 1) * 100) + "%",
+    ].join("  ");
+    left.appendChild(el("div", {
+      fontFamily: MONO, fontSize: "11px", color: "#5E7080", marginTop: "3px",
+    }, stats));
+    row.appendChild(left);
+
+    const b = el("button", {
+      fontFamily: MONO, fontSize: "13px", padding: "9px 15px", borderRadius: "2px",
+      whiteSpace: "nowrap", minHeight: "42px",
+      background: afford ? C.amber : "transparent",
+      color: equipped ? "#4A5766" : afford ? "#1A1207" : owned ? C.paper : "#5E7080",
+      border: afford ? "none" : "1px solid #2B3D4E",
+      cursor: equipped || (!owned && !afford) ? "default" : "pointer",
+      fontWeight: afford ? "700" : "400",
+    }, equipped ? "IN HAND" : owned ? "Equip" : "◆" + w.gb);
+    if (!equipped && (owned || afford)) {
+      b.onclick = () => {
+        if (!owned) {
+          META.gb -= w.gb;
+          META.weapons = [...(META.weapons || ["pump"]), w.id];
+        }
+        META.weapon = w.id;
+        persist();
+        render();
+      };
+    }
+    row.appendChild(b);
+    kids.push(row);
+  });
+
+  /* ---- FINISHES: cosmetic only ---- */
+  kids.push(heading("FINISHES · ◆" + (META.gb || 0)));
+  kids.push(el("div", {
+    fontSize: "13px", color: "#7C8B9A", marginBottom: "10px", lineHeight: "1.5",
+  }, "Earned every round — more for filling the bag, taking a buck, or beating your best. Colour never changes a stat."));
+
+  const swatches = el("div", {
+    display: "flex", flexWrap: "wrap", gap: "8px", marginBottom: "6px",
+  });
+  SKINS.forEach((k) => {
+    const owned = (META.skins || ["blued"]).includes(k.id);
+    const equipped = (META.skin || "blued") === k.id;
+    const afford = !owned && (META.gb || 0) >= k.gb;
+    const b = el("button", {
+      display: "flex", alignItems: "center", gap: "7px",
+      background: "transparent",
+      border: "1px solid " + (equipped ? C.amber : "#2B3D4E"),
+      borderRadius: "2px", padding: "9px 11px", minHeight: "42px",
+      cursor: equipped || (!owned && !afford) ? "default" : "pointer",
+      opacity: owned || afford ? "1" : "0.45",
+    });
+    b.appendChild(el("span", {
+      width: "18px", height: "12px", borderRadius: "2px", flexShrink: "0",
+      background: "linear-gradient(" + k.lit + ", " + k.metal + ")",
+      border: "1px solid #00000055",
+    }));
+    b.appendChild(el("span", {
+      fontFamily: MONO, fontSize: "11px", color: owned ? C.paper : "#7C8B9A",
+    }, k.name));
+    b.appendChild(el("span", {
+      fontFamily: MONO, fontSize: "11px", color: owned ? "#4A5766" : "#C9A227",
+    }, owned ? (equipped ? "✓" : "") : "◆" + k.gb));
+    if (!equipped && (owned || afford)) {
+      b.onclick = () => {
+        if (!owned) {
+          META.gb -= k.gb;
+          META.skins = [...(META.skins || ["blued"]), k.id];
+        }
+        META.skin = k.id;
+        persist();
+        render();
+      };
+    }
+    swatches.appendChild(b);
+  });
+  kids.push(swatches);
+
+  kids.push(heading("THE CREW"));
+  kids.push(hireRow("dog2", "Second dog", HIRE_DOG,
+    "A second retriever working alongside yours"));
+  if (META.hired.dog2) {
+    kids.push(upgradeRow("dog2", DOG, "Second dog",
+      (l) => `${DOG[l].speed} speed · carries ${DOG[l].carry}`));
+  }
+  kids.push(hireRow("hunter2", "Hired gun", HIRE_HUNTER,
+    "A second hunter who shoots on his own"));
+  if (META.hired.hunter2) {
+    kids.push(upgradeRow("hunter2", HUNTER2, "Hired gun",
+      (l) => `every ${(HUNTER2[l].every / 1000).toFixed(1)}s · ${Math.round(HUNTER2[l].acc * 100)}% hits`));
+  }
+
+  kids.push(heading("DUCKS"));
+  DUCKS.forEach((d, i) => {
+    if (i === 0) return;
+    const offered = META.round >= d.unlock;
+    const owned = META.ducks[i];
+    const afford = offered && !owned && META.money >= d.cost;
+    const row = el("div", { ...rowStyle, opacity: offered ? "1" : "0.45" });
+    const left = el("div");
+    left.appendChild(el("div", { fontSize: "16px" },
+      `${offered ? d.name : "????"} · $${d.value} a bird`));
+    left.appendChild(el("div", {
+      fontFamily: MONO, fontSize: "12px", color: "#7C8B9A", marginTop: "4px",
+    }, offered ? d.note : `Word of them reaches you at round ${d.unlock}`));
+    row.appendChild(left);
+    const b = el("button", {
+      fontFamily: MONO, fontSize: "13px", padding: "9px 15px", borderRadius: "2px",
+      background: afford ? C.amber : "transparent",
+      color: owned ? "#4A5766" : afford ? "#1A1207" : "#5E7080",
+      border: afford ? "none" : "1px solid #2B3D4E",
+      cursor: afford ? "pointer" : "default",
+      fontWeight: afford ? "700" : "400",
+    }, owned ? "OWNED" : !offered ? "—" : `$${d.cost}`);
+    if (afford) {
+      b.onclick = () => {
+        META.money -= d.cost;
+        META.ducks[i] = true;
+        persist();
+        render();
+      };
+    }
+    row.appendChild(b);
+    kids.push(row);
+  });
+
+  kids.push(heading("PLACES"));
+  PLACES.forEach((pl, i) => {
+    const owned = META.places[i];
+    const active = META.place === i;
+    const afford = !owned && META.money >= pl.cost;
+    const row = el("div", rowStyle);
+    const left = el("div", { display: "flex", alignItems: "center", gap: "11px" });
+    left.appendChild(el("span", {
+      width: "14px", height: "26px", borderRadius: "2px", flexShrink: "0",
+      background: `linear-gradient(${pl.sky[1]}, ${pl.sky[3]})`,
+      border: `1px solid ${active ? pl.accent : "#2B3D4E"}`,
+    }));
+    const info = el("div");
+    info.appendChild(el("div", { fontSize: "16px" },
+      pl.name + (active ? " · hunting here" : "")));
+    info.appendChild(el("div", {
+      fontFamily: MONO, fontSize: "12px", color: "#7C8B9A", marginTop: "4px", lineHeight: "1.45",
+    }, `${pl.note}  ×${pl.valueMul} value · ×${pl.speedMul} speed`));
+    left.appendChild(info);
+    row.appendChild(left);
+    const b = el("button", {
+      fontFamily: MONO, fontSize: "13px", padding: "9px 15px", borderRadius: "2px",
+      whiteSpace: "nowrap",
+      background: afford ? C.amber : "transparent",
+      color: active ? "#4A5766" : afford ? "#1A1207" : owned ? C.paper : "#5E7080",
+      border: afford ? "none" : "1px solid #2B3D4E",
+      cursor: active || (!owned && !afford) ? "default" : "pointer",
+    }, active ? "HERE" : owned ? "Hunt" : `$${pl.cost}`);
+    if (!active && (owned || afford)) {
+      b.onclick = () => {
+        if (!owned) { META.money -= pl.cost; META.places[i] = true; }
+        META.place = i;
+        persist();
+        render();
+      };
+    }
+    row.appendChild(b);
+    kids.push(row);
+  });
+
+  const bar = el("div", { display: "flex", gap: "10px", flexWrap: "wrap", marginTop: "20px" });
+  const go = el("button", btnStyle(), "Head out");
+  go.onclick = () => { META.round += 1; persist(); startRound(); };
+  bar.appendChild(go);
+  const back = el("button", btnStyle("ghost"), "Back");
+  back.onclick = () => UI.show("brief");
+  bar.appendChild(back);
+  kids.push(bar);
+  return panel(kids);
+}
+
+function hireRow(key, title, price, sub) {
+  const owned = META.hired[key];
+  const afford = !owned && META.money >= price;
+  const row = el("div", rowStyle);
+  const left = el("div");
+  left.appendChild(el("div", { fontSize: "16px" }, title));
+  left.appendChild(el("div", {
+    fontFamily: MONO, fontSize: "12px", color: "#7C8B9A", marginTop: "4px",
+  }, owned ? "On the line" : sub));
+  row.appendChild(left);
+  const b = el("button", {
+    fontFamily: MONO, fontSize: "13px", padding: "9px 15px", borderRadius: "2px",
+    background: afford ? C.amber : "transparent",
+    color: owned ? "#4A5766" : afford ? "#1A1207" : "#5E7080",
+    border: afford ? "none" : "1px solid #2B3D4E",
+    cursor: afford ? "pointer" : "default",
+    fontWeight: afford ? "700" : "400",
+  }, owned ? "HIRED" : `$${price}`);
+  if (afford) {
+    b.onclick = () => {
+      META.money -= price;
+      META.hired[key] = true;
+      persist();
+      render();
+    };
+  }
+  row.appendChild(b);
+  return row;
+}
+
+function resultsScreen() {
+  const s = SUMMARY || { bagged: 0, lost: 0, missed: 0, earned: 0, reason: "", byType: {} };
+  const kids = [];
+  kids.push(el("div", {
+    fontFamily: MONO, fontSize: "12px", letterSpacing: "0.2em",
+    color: C.amber, marginBottom: "12px",
+  }, (s.reason || "").toUpperCase()));
+
+  const row = (label, value, dim, accent) => {
+    const r = el("div", {
+      display: "flex", justifyContent: "space-between", padding: "5px 0",
+      fontFamily: MONO, fontSize: "14px",
+      color: dim ? "#7C8B9A" : accent ? C.amber : C.paper,
+    });
+    r.appendChild(el("span", {}, label));
+    r.appendChild(el("span", {}, String(value)));
+    return r;
+  };
+
+  kids.push(row("Ducks bagged", s.bagged));
+  DUCKS.forEach((d, i) => {
+    if (s.byType && s.byType[i]) {
+      kids.push(row(`   ${d.name} ×${s.byType[i]}`, `$${d.value * s.byType[i]}`, true));
+    }
+  });
+  kids.push(row("Lost to the water", s.lost, true));
+  kids.push(row("Shells wasted", s.missed, true));
+  if (s.isBest) {
+    kids.push(el("div", {
+      fontFamily: MONO, fontSize: "12px", color: C.amber,
+      marginTop: "8px", letterSpacing: "0.14em",
+    }, "NEW BEST BAG"));
+  }
+  kids.push(el("div", { height: "1px", background: "#2B3D4E", margin: "14px 0" }));
+  kids.push(row("Earned", `$${s.earned}`, false, true));
+  if (s.gbEarned) {
+    kids.push(el("div", {
+      fontFamily: MONO, fontSize: "12px", color: "#C9A227", marginTop: "6px",
+    }, `◆ ${s.gbEarned} gold shell${s.gbEarned === 1 ? "" : "s"} earned`));
+  }
+
+  const bar = el("div", { display: "flex", gap: "10px", marginTop: "20px", flexWrap: "wrap" });
+  const shop = el("button", btnStyle(), "Outfitter");
+  shop.onclick = () => UI.show("shop");
+  bar.appendChild(shop);
+  const next = el("button", btnStyle("ghost"), "Next round");
+  next.onclick = () => { META.round += 1; persist(); startRound(); };
+  bar.appendChild(next);
+  kids.push(bar);
+  return panel(kids);
+}
+
+/* Create the canvas element ONCE and keep it. Rebuilding it on every render
+   was the black-screen bug: pausing re-renders, which made a fresh canvas
+   with no bitmap size while CTX still pointed at the old detached one, so
+   after Resume the game was drawing into an element nobody could see. */
+function makeCanvas() {
+  const cv = el("canvas");
+  Object.assign(cv.style, {
+    display: "block",
+    aspectRatio: `${W} / ${H}`,
+    margin: "0 auto",
+    borderRadius: "3px",
+    touchAction: "none", cursor: "crosshair", border: "1px solid #26374A",
+  });
+  sizeCanvasToViewport(cv);
+  cv.onpointerdown = (e) => {
+    const r = cv.getBoundingClientRect();
+    Sound.resume();
+    fire(((e.clientX - r.left) * W) / r.width, ((e.clientY - r.top) * H) / r.height);
+  };
+  cv.onpointermove = (e) => {
+    if (!G) return;
+    const r = cv.getBoundingClientRect();
+    G.aim = {
+      x: ((e.clientX - r.left) * W) / r.width,
+      y: ((e.clientY - r.top) * H) / r.height,
+    };
+  };
+  CANVAS = cv;
+  return cv;
+}
+
+/* Fit the canvas to whichever dimension runs out first. Using width alone
+   makes a landscape phone scroll to find the game; using both means it
+   always lands fully on screen. */
+function sizeCanvasToViewport(cv) {
+  const vw = window.innerWidth || 900;
+  const vh = window.innerHeight || 560;
+  const landscapePhone = vh <= 500 && vw > vh;
+
+  // room left after padding and the header
+  const padX = landscapePhone ? 4 : isNarrow() ? 8 : 16;
+  const chromeY = landscapePhone ? 34 : isNarrow() ? 58 : 86;
+
+  const availW = Math.min(vw - padX * 2, 1400);
+  const availH = vh - chromeY;
+
+  // pick the limiting dimension
+  let w = availW;
+  let h = (w * H) / W;
+  if (h > availH) {
+    h = availH;
+    w = (h * W) / H;
+  }
+
+  cv.style.width = Math.floor(w) + "px";
+  cv.style.height = Math.floor(h) + "px";
+  cv.style.maxWidth = "100%";
+}
+
+/* Size the bitmap and take a fresh context. Safe to call repeatedly. */
+function initCanvasBitmap() {
+  if (!CANVAS) makeCanvas();
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  DPR = dpr;
+  CANVAS.width = W * dpr;
+  CANVAS.height = H * dpr;
+  CTX = CANVAS.getContext("2d");
+  CTX.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function playScreen() {
+  const outer = el("div");
+  const hint = orientationHint();
+  if (hint) outer.appendChild(hint);
+  const box = el("div", { position: "relative" });
+
+  if (!CANVAS) makeCanvas();
+  // The bitmap is dropped whenever width/height are touched, so only
+  // re-initialise when it's actually missing — never on a pause re-render.
+  if (!CTX || CTX.canvas !== CANVAS || CANVAS.width === 0) initCanvasBitmap();
+  box.appendChild(CANVAS);
+
+  const hud = el("div", {
+    position: "absolute", top: "12px", left: "14px", right: "14px",
+    display: "flex", justifyContent: "space-between", pointerEvents: "none",
+    fontFamily: MONO, fontSize: "13px", textShadow: "0 1px 3px #000",
+    color: C.paper,
+  });
+  const sh = el("span", { color: C.amber }); sh.id = "hudShells";
+  const bg = el("span"); bg.id = "hudBag";
+  const tm = el("span"); tm.id = "hudTime";
+  hud.appendChild(sh); hud.appendChild(bg); hud.appendChild(tm);
+  box.appendChild(hud);
+
+  const pauseBtn = el("button", {
+    position: "absolute", top: "34px", right: "14px",
+    background: "rgba(10,17,25,0.75)", border: "1px solid #3A4C5E",
+    borderRadius: "2px", color: C.paper, cursor: "pointer",
+    fontFamily: MONO, fontSize: "16px", padding: "10px 14px", lineHeight: "1",
+    minWidth: "44px", minHeight: "44px",   // a thumb-sized target on a phone
+  }, G && G.paused ? "▶" : "❚❚");
+  pauseBtn.onclick = () => { Sound.resume(); setPause(!(G && G.paused)); };
+  box.appendChild(pauseBtn);
+
+  if (G && G.paused) {
+    const ov = el("div", {
+      position: "absolute", inset: "0", display: "flex",
+      flexDirection: "column", alignItems: "center", justifyContent: "center",
+      background: "rgba(10,17,25,0.82)", borderRadius: "3px", gap: "14px",
+      color: C.paper, fontFamily: SERIF,
+    });
+    ov.appendChild(el("div", {
+      fontSize: "24px", letterSpacing: "0.3em", textTransform: "uppercase",
+    }, "Paused"));
+    ov.appendChild(el("div", {
+      fontFamily: MONO, fontSize: "12px", color: "#7C8B9A",
+    }, `${G.bagged}/${BAG[META.lvl.bag].cap} in the bag`));
+    const res = el("button", { ...btnStyle(), minHeight: "48px", padding: "14px 30px" }, "Resume");
+    res.onclick = () => { Sound.resume(); setPause(false); };
+    ov.appendChild(res);
+    box.appendChild(ov);
+  }
+  outer.appendChild(box);
+  return outer;
+}
+
+function transferPanel() {
+  const box = el("div", {
+    marginTop: "24px", paddingTop: "16px", borderTop: "1px solid #1E2E3E",
+  });
+  box.appendChild(el("div", {
+    fontFamily: MONO, fontSize: "11px", letterSpacing: "0.18em",
+    color: "#6E8496", marginBottom: "8px",
+  }, "MOVE THIS SAVE"));
+  box.appendChild(el("div", {
+    fontSize: "13px", color: "#7C8B9A", lineHeight: "1.5", marginBottom: "10px",
+  }, window.storageInfo && window.storageInfo.mode === "account"
+      ? "Progress follows your Chrome account automatically — sign into Chrome on another computer and it's there. Codes are for moving a save to or from the browser file, which has separate storage."
+      : "Chrome sync is unavailable, so progress is kept on this device. Use a code to move it elsewhere."));
+
+  const ta = el("textarea");
+  Object.assign(ta.style, {
+    width: "100%", boxSizing: "border-box", background: "#0E1822",
+    border: "1px solid #2B3D4E", color: "#9DAEBC", padding: "9px 11px",
+    fontFamily: MONO, fontSize: "11px", borderRadius: "2px",
+    outline: "none", resize: "vertical",
+  });
+  ta.rows = 2;
+  ta.placeholder = "Paste a save code here";
+  ta.value = CODE;
+  ta.oninput = (e) => { CODE = e.target.value; };
+  box.appendChild(ta);
+
+  const bar = el("div", { display: "flex", gap: "8px", marginTop: "8px", flexWrap: "wrap" });
+  const ex = el("button", { ...btnStyle(), padding: "9px 16px", fontSize: "12px" }, "Export");
+  ex.onclick = () => {
+    CODE = Save.encode(META);
+    CODE_NOTE = "Copied. Paste it into your other copy of the game.";
+    if (navigator.clipboard) navigator.clipboard.writeText(CODE).catch(() => {});
+    render();
+  };
+  bar.appendChild(ex);
+  const im = el("button", { ...btnStyle("ghost"), padding: "9px 16px", fontSize: "12px" }, "Load code");
+  im.onclick = () => {
+    const d = Save.decode(CODE);
+    if (!d) { CODE_NOTE = "That code didn't read. Check for missing characters."; render(); return; }
+    loadInto(d);
+    CODE_NOTE = "Save loaded.";
+    persist();
+    UI.show("brief");
+  };
+  bar.appendChild(im);
+  box.appendChild(bar);
+
+  if (CODE_NOTE) {
+    box.appendChild(el("div", {
+      fontFamily: MONO, fontSize: "11px", color: C.amber, marginTop: "8px",
+    }, CODE_NOTE));
+  }
+  return box;
+}
+
+function loadInto(d) {
+  const m = newGame();
+  m.hunter = d.hunter || "Hunter";
+  m.dogName = d.dogName || "Scout";
+  m.money = d.money ?? 0;
+  m.round = d.round ?? 1;
+  m.best = d.best ?? 0;
+  m.ducks = Array.isArray(d.ducks) ? [...d.ducks] : [true, false, false];
+  m.places = Array.isArray(d.places) ? [...d.places] : [true, false, false];
+  m.place = d.place ?? 0;
+  m.hired = { dog2: false, hunter2: false, ...(d.hired || {}) };
+  m.lvl = { ...BLANK_LVL, ...(d.lvl || {}) };
+  META = m;
+}
+
+/* Landscape is a much bigger playing field on a phone — 16:10 in portrait
+   leaves the game about a third of the screen. A hint, not a blocker. */
+function orientationHint() {
+  if (!isNarrow() || !isPortrait()) return null;
+  const bar = el("div", {
+    fontFamily: MONO, fontSize: "11px", color: "#C9A227",
+    textAlign: "center", padding: "7px 10px", marginBottom: "6px",
+    border: "1px solid #3A3520", borderRadius: "2px",
+    background: "rgba(201,162,39,0.08)",
+  }, "↻ Turn your phone sideways for a bigger view");
+  return bar;
+}
+
+let resizeTimer = 0;
+function refit() {
+  if (CANVAS) sizeCanvasToViewport(CANVAS);
+  render();
+}
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(refit, 150);
+});
+// iOS fires orientationchange before the new dimensions settle, so re-fit
+// again a moment later or the game keeps the old size after a rotate.
+window.addEventListener("orientationchange", () => {
+  setTimeout(refit, 60);
+  setTimeout(refit, 350);
+});
+
+/* Another device saved while we're open. Adopt it if we're in a menu; if a
+   round is in progress, wait rather than yanking the game out from under
+   the player. */
+window.onRemoteSaveChanged = async function () {
+  if (SCREEN === "playing") return;
+  const fresh = await Save.load();
+  if (!fresh) return;
+  loadInto(fresh);
+  SAVED = fresh;
+  UI.note("Updated from another device");
+  render();
+};
+
+/* ---------------- boot ---------------- */
+
+window.addEventListener("keydown", (e) => {
+  if (SCREEN !== "playing") return;
+  if (e.code === "Space" || e.code === "Escape") {
+    e.preventDefault();
+    Sound.resume();
+    setPause(!(G && G.paused));
+  }
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && SCREEN === "playing") setPause(true);
+});
+
+(async function boot() {
+  REDUCED = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false;
+  await Save.probe();
+  const m = await STORE.get("limitout:muted");
+  Sound.setMuted(m === "1");
+  SAVED = await Save.load();
+  render();
+})();
+
+</script>
+
+<script>
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", function () {
+    navigator.serviceWorker.register("sw.js").catch(function () {});
+  });
+}
+</script>
+</body>
+</html>

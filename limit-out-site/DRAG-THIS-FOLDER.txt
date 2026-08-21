@@ -1,0 +1,7 @@
+You are in the right folder.
+
+Drag the folder CONTAINING this file (called "limit-out-site") onto
+app.netlify.com/drop — not the "icons" folder inside it.
+
+Netlify should report about 8-10 files, ~160 KB.
+If it says 4 files and 11 KB, you dragged "icons" by mistake.
