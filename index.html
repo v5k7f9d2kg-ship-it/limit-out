@@ -589,7 +589,7 @@ function newGame() {
   return {
     t: 0,
     round: 1,
-    money: 0,
+    money: 20000,
     hunter: "",
     dogName: "",
     best: 0,
@@ -597,7 +597,7 @@ function newGame() {
     place: 0,
     places: [true, false, false, false],
     hired: { dog2: false, hunter2: false },
-    gb: 0,                       // gold shells
+    gb: 500,                     // gold shells (QA build: loaded start)
     grants: [GRANT.id],          // a fresh save never lost anything
     weapon: "pump",
     skin: "blued",
