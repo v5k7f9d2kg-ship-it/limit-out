@@ -7,7 +7,7 @@
    Bump CACHE when you deploy a new build, or phones will keep serving the
    old one from cache. That's the single most common PWA mistake. */
 
-const CACHE = "limit-out-v2";
+const CACHE = "limit-out-v9";
 
 const FILES = [
   "./",

@@ -134,15 +134,47 @@ var UI = typeof UI !== "undefined" ? UI : { results() {}, wallet() {}, show() {}
    React state is ONLY used for UI chrome, synced at 12Hz.
 ------------------------------------------------------------------ */
 
-const W = 900;
+/* ------------------------------------------------------------------
+   WORLD SIZE
+   Height is fixed so gameplay never changes — ducks always fly at the same
+   altitude and the water is always in the same place. WIDTH adapts to the
+   device, because every phone since the iPhone 12 is about 2.17:1 while the
+   old fixed 900x560 world is 1.61:1. Fitting that into a landscape phone
+   left huge black bars; widening the world fills the screen instead, and
+   gives you more sky to shoot across rather than a stretched picture.
+------------------------------------------------------------------ */
 const H = 560;
+const W_MIN = 820;    // roughly an iPad / square-ish window
+const W_MAX = 1300;   // widest phone, plus headroom
+
+let W = 900;          // replaced by setWorldWidth() before the first frame
+
+function clampW(v) {
+  return Math.max(W_MIN, Math.min(W_MAX, v));
+}
+
+function worldWidthFor(vw, vh) {
+  if (!vw || !vh) return 900;
+  return Math.round(clampW(H * (vw / vh)));
+}
+
+/* Recompute the world and everything positioned relative to its width.
+   Returns true when the width actually changed, so callers know to
+   re-render the cached background. */
+function setWorldWidth(next) {
+  const w = Math.round(clampW(next));
+  if (w === W) return false;
+  W = w;
+  GUN_PIVOT.x = W / 2;          // the gun stays centred, FPS-style
+  return true;
+}
 const WATER_Y = 402;
 const KENNEL = { x: 78, y: 496 };
 // Gun pivot: bottom-centre, just below the frame. First-person framing —
 // the gun rises out of the middle of the screen rather than poking in from
 // the side. Sitting a little below the edge keeps the receiver and handguard
 // visible while the stock runs off-screen, which is how an FPS reads.
-const GUN_PIVOT = { x: 450, y: 596 };
+const GUN_PIVOT = { x: 450, y: 596 };  // x is kept at W/2 by setWorldWidth()
 const GUN_MIN_ANG = -Math.PI * 0.95;
 const GUN_MAX_ANG = -Math.PI * 0.08;
 const ROUND_MS = 60000;
@@ -365,7 +397,7 @@ const WEAPONS = [
     id: "ak47", name: "AK-47", cost: 0, gb: 55,
     shellMul: 1.7, reloadMul: 0.72, spreadMul: 0.55, pelletAdd: 1, valueMul: 1.1,
     blurb: "Heavier round. Fewer shells than the AR, but hits harder.",
-    art: { barrel: 300, bore: 5.5, form: "rifle", stock: "wood", grip: true, forend: "wood", mag: "curved", carrier: false, shield: false, optic: "post", brake: false },
+    art: { barrel: 232, bore: 5.5, form: "rifle", stock: "wood", grip: true, forend: "wood", mag: "curved", carrier: false, shield: false, optic: "post", brake: false },
   },
   {
     id: "pistol", name: "Pistol", cost: 0, gb: 30,
@@ -377,7 +409,7 @@ const WEAPONS = [
     id: "crossbow", name: "Crossbow", cost: 0, gb: 80,
     shellMul: 0.35, reloadMul: 2.2, spreadMul: 0.18, pelletAdd: -2, valueMul: 2.6,
     blurb: "One bolt, slow to crank, no pattern at all. Pays like nothing else.",
-    art: { barrel: 250, bore: 4, form: "crossbow", stock: "wood", grip: true, forend: null, mag: false, carrier: false, shield: false, optic: "scope", brake: false },
+    art: { barrel: 250, bore: 4, form: "crossbow", stock: "wood", grip: true, forend: null, mag: "none", carrier: false, shield: false, optic: "scope", brake: false },
   },
 ];
 
@@ -388,7 +420,8 @@ const SKINS = [
   { id: "gunmetal", name: "Gunmetal",   gb: 6,  metal: "#3E464E", lit: "#69747E", wood: "#5A5A5E" },
   { id: "olive",  name: "Olive Drab",   gb: 8,  metal: "#3D4429", lit: "#5D6640", wood: "#6B6142" },
   { id: "tan",    name: "Desert Tan",   gb: 10, metal: "#8A7654", lit: "#B39C74", wood: "#9C8663" },
-  { id: "camo",   name: "Marsh Camo",   gb: 14, metal: "#3A4230", lit: "#59654A", wood: "#4A4632", camo: true },
+  { id: "camo",   name: "Marsh Camo",   gb: 14, metal: "#6B6B48", lit: "#8A8A5E", wood: "#5E5A3C",
+    camo: ["#2E3320", "#4A4A2C", "#7A6B42", "#8F8558", "#232A1A"] },
   { id: "crimson", name: "Crimson",     gb: 18, metal: "#6E1F22", lit: "#A33A38", wood: "#4A2018" },
   { id: "copper", name: "Copper",       gb: 24, metal: "#8A5230", lit: "#C4834E", wood: "#6B4028" },
   { id: "silver", name: "Silver",       gb: 34, metal: "#B8C0C6", lit: "#E8EEF2", wood: "#8A9198", shine: true },
@@ -400,6 +433,30 @@ const SKINS = [
 /* Gold shells: the premium currency. Earned in play as well as bought, so
    nothing in the game is ever locked behind a purchase. Supply is generous
    because shells now buy guns as well as finishes. */
+/* ------------------------------------------------------------------
+   MAKE-GOOD GRANT
+   Gold shells, guns and finishes were being written to the save correctly
+   and then dropped on load, so anyone who played before this build lost
+   everything they'd bought. This grants it back once — enough to re-buy a
+   gun and a finish outright — and marks the save so it never repeats.
+   Raise GRANT.id if a future mistake ever needs the same treatment.
+------------------------------------------------------------------ */
+const GRANT = {
+  id: "shells-restore-1",
+  shells: 120,
+  note: "Gold shells you'd earned weren't saving properly. Here's 120 back, with apologies.",
+};
+
+/* Apply once per save. Returns the amount granted, or 0. */
+function applyGrant(meta) {
+  if (!meta) return 0;
+  if (!Array.isArray(meta.grants)) meta.grants = [];
+  if (meta.grants.includes(GRANT.id)) return 0;
+  meta.grants.push(GRANT.id);
+  meta.gb = (meta.gb || 0) + GRANT.shells;
+  return GRANT.shells;
+}
+
 const GB = {
   perRound: 1,        // finishing any round
   perFullBag: 3,      // filling the bag
@@ -446,7 +503,7 @@ const PLACES = [
     note: "Warm dawn, still backwater, cypress standing in the shallows.",
     sky: ["#141F2E", "#2C4256", "#8A6E4E", "#B08A5C"],
     water: ["#43554F", "#2E4046", "#243239"],
-    sun: "#E8A33D", sunR: 46, sunX: 690, sunY: 336, accent: "#E8A33D",
+    sun: "#E8A33D", sunR: 46, sunF: 0.77, sunY: 336, accent: "#E8A33D",
   },
   {
     id: "prairie", name: "Prairie Pothole", cost: 1400,
@@ -454,7 +511,7 @@ const PLACES = [
     note: "Open sky, no cover, hard wind. Birds come in fast and high.",
     sky: ["#1B2740", "#3A5578", "#9C8A6E", "#D6B98A"],
     water: ["#4E6270", "#354A58", "#26363F"],
-    sun: "#F2C46A", sunR: 34, sunX: 240, sunY: 352, accent: "#F2C46A",
+    sun: "#F2C46A", sunR: 34, sunF: 0.27, sunY: 352, accent: "#F2C46A",
   },
   {
     id: "tundra", name: "Frozen Flats", cost: 5200,
@@ -462,7 +519,7 @@ const PLACES = [
     note: "Snow, black ice and a low grey sun. Birds go under fast in the cold.",
     sky: ["#243040", "#4A5C72", "#8FA3B8", "#C8D6E2"],
     water: ["#8CA3B4", "#6E8496", "#54697C"],
-    sun: "#EAF2F8", sunR: 28, sunX: 620, sunY: 360, accent: "#9FC4E0",
+    sun: "#EAF2F8", sunR: 28, sunF: 0.69, sunY: 360, accent: "#9FC4E0",
   },
   {
     id: "ridge", name: "Hardwood Ridge", cost: 10000,
@@ -475,7 +532,7 @@ const PLACES = [
     note: "Oak timber at first light. Turkeys on the ground — flush them, then shoot.",
     sky: ["#1E2A22", "#3E5240", "#8A8452", "#C4B074"],
     water: ["#4A4230", "#3A3426", "#2A261C"],  // leaf litter, not water
-    sun: "#F0D98A", sunR: 30, sunX: 300, sunY: 344, accent: "#C9A24B",
+    sun: "#F0D98A", sunR: 30, sunF: 0.33, sunY: 344, accent: "#C9A24B",
   },
 ];
 
@@ -541,6 +598,7 @@ function newGame() {
     places: [true, false, false, false],
     hired: { dog2: false, hunter2: false },
     gb: 0,                       // gold shells
+    grants: [GRANT.id],          // a fresh save never lost anything
     weapon: "pump",
     skin: "blued",
     weapons: ["pump"],
@@ -606,6 +664,7 @@ const Save = {
       place: meta.place ?? 0,
       hired: { ...(meta.hired || { dog2: false, hunter2: false }) },
       gb: meta.gb || 0,
+      grants: [...(meta.grants || [])],
       weapon: meta.weapon || "pump",
       skin: meta.skin || "blued",
       weapons: [...(meta.weapons || ["pump"])],
@@ -700,6 +759,9 @@ const Save = {
       round: int(d.round, 1, 100000, 1),
       best: int(d.best, 0, 100000, 0),
       gb: int(d.gb, 0, 1e6, 0),
+      grants: Array.isArray(d.grants)
+        ? d.grants.filter((g) => typeof g === "string").slice(0, 20)
+        : [],
       ducks: DUCKS.map((dk, i) =>
         dk.onlyAt ? true : i === 0 ? true : Array.isArray(d.ducks) ? !!d.ducks[i] : false
       ),
@@ -761,7 +823,7 @@ function newRound(meta) {
       return arr;
     })(),
     h2: meta.hired?.hunter2
-      ? { x: 205, y: WATER_Y + 30, ang: -Math.PI / 2, nextShot: 1800, recoil: 0, muzzle: 0 }
+      ? { x: Math.round(W * 0.22), y: WATER_Y + 30, ang: -Math.PI / 2, nextShot: 1800, recoil: 0, muzzle: 0 }
       : null,
     shells: shellsFor(meta),
     reloadUntil: 0,
@@ -920,7 +982,9 @@ const BANDS = [
 ];
 
 function drawBand(ctx, band, t, WATER_Y) {
-  for (let i = 0; i < band.n; i++) {
+  // enough repeats to span whatever width the world ended up
+  const count = Math.max(band.n, Math.ceil(W / band.step) + 2);
+  for (let i = 0; i < count; i++) {
     const seed = i * 7 + band.off;
     const x = band.off + i * band.step + ((seed * 29) % 34) - 17;
     const h = band.h + ((seed * 41) % band.hv);
@@ -969,6 +1033,8 @@ function drawGun(ctx, s, reloadProgress, weapon, skin) {
   const woodDark = shade(skin.wood, -0.3);
   const BL = A.barrel;
   const bore = A.bore;
+  // crossbow rail stops at the riser rather than running past the limb tips
+  const RAIL_LEN = BL * 0.56 - 10;
 
   /* ---------- stock ---------- */
   if (A.stock === "wood" || A.stock === "poly") {
@@ -1018,20 +1084,22 @@ function drawGun(ctx, s, reloadProgress, weapon, skin) {
 
   /* ---------- pistol grip ---------- */
   if (A.grip) {
+    // Behind the trigger guard (guard sits at x -20), raked back like a real
+    // rifle grip. Magazine goes forward of the guard, further down.
     ctx.fillStyle = A.stock === "wood" ? wood : steel;
     ctx.beginPath();
-    ctx.moveTo(-18, 8);
-    ctx.lineTo(-40, 58);
-    ctx.lineTo(-16, 64);
-    ctx.lineTo(4, 14);
+    ctx.moveTo(-40, 12);
+    ctx.lineTo(-66, 60);
+    ctx.lineTo(-44, 68);
+    ctx.lineTo(-20, 18);
     ctx.closePath();
     ctx.fill();
     ctx.strokeStyle = shade(A.stock === "wood" ? wood : steel, -0.4);
     ctx.lineWidth = 1.6;
     for (let i = 0; i < 4; i++) {
       ctx.beginPath();
-      ctx.moveTo(-20 - i * 5, 20 + i * 10);
-      ctx.lineTo(-2 - i * 5, 26 + i * 10);
+      ctx.moveTo(-44 - i * 5, 24 + i * 10);
+      ctx.lineTo(-26 - i * 5, 30 + i * 10);
       ctx.stroke();
     }
   }
@@ -1048,63 +1116,176 @@ function drawGun(ctx, s, reloadProgress, weapon, skin) {
   ctx.roundRect(-14, -14, 34, 11, 2);
   ctx.fill();
 
+  // Guard sits forward of the grip. It used to be centred at -20 with the
+  // grip starting at -30, so the two overlapped and the grip covered the
+  // trigger. Front-to-back is now: magazine, guard, grip — no overlap.
   ctx.strokeStyle = steel;
   ctx.lineWidth = 4;
   ctx.beginPath();
-  ctx.arc(-20, 24, 11, -0.2, Math.PI + 0.4);
+  ctx.arc(A.grip ? -4 : -20, 24, 11, -0.2, Math.PI + 0.4);
   ctx.stroke();
 
   /* ---------- magazine ---------- */
   if (A.mag === "box") {
+    // Straight AR-style stick magazine, hanging well clear of the receiver.
+    // A pistol's magazine lives inside the grip; a rifle's hangs forward of
+    // the trigger guard.
+    const magX = A.form === "pistol" ? -8 : 8;
+    const magLen = A.form === "pistol" ? 38 : 92;
     ctx.fillStyle = steel;
     ctx.beginPath();
-    ctx.roundRect(-6, 12, 22, A.form === "pistol" ? 34 : 46, 3);
+    ctx.roundRect(magX, 12, 24, magLen, 3);
     ctx.fill();
     ctx.fillStyle = steelDark;
-    ctx.fillRect(-2, 18, 3, A.form === "pistol" ? 22 : 32);
+    ctx.beginPath();
+    ctx.roundRect(magX - 3, 12 + magLen - 8, 30, 10, 2);
+    ctx.fill();
+    if (A.form !== "pistol") {
+      ctx.fillStyle = steelDark;
+      for (let i = 0; i < 5; i++) {
+        ctx.beginPath();
+        ctx.roundRect(magX + 5, 26 + i * 14, 13, 5, 2);
+        ctx.fill();
+      }
+      ctx.strokeStyle = steelLit;
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.moveTo(magX + 2, 16);
+      ctx.lineTo(magX + 2, 12 + magLen - 10);
+      ctx.stroke();
+    }
   } else if (A.mag === "curved") {
+    // AK banana magazine: long, and curving FORWARD toward the muzzle.
     ctx.fillStyle = steel;
     ctx.beginPath();
-    ctx.moveTo(-6, 12);
-    ctx.quadraticCurveTo(6, 42, 24, 56);
-    ctx.lineTo(40, 45);
-    ctx.quadraticCurveTo(24, 33, 16, 12);
+    ctx.moveTo(8, 12);
+    ctx.quadraticCurveTo(22, 56, 60, 92);     // outer edge sweeping forward
+    ctx.lineTo(82, 74);
+    ctx.quadraticCurveTo(46, 44, 34, 12);     // inner edge back to the receiver
     ctx.closePath();
     ctx.fill();
+
+    // floorplate at the forward end
+    ctx.fillStyle = steelDark;
+    ctx.beginPath();
+    ctx.moveTo(58, 94);
+    ctx.lineTo(86, 72);
+    ctx.lineTo(80, 64);
+    ctx.lineTo(52, 86);
+    ctx.closePath();
+    ctx.fill();
+
+    // ribs following the curve
     ctx.strokeStyle = steelDark;
     ctx.lineWidth = 2;
+    for (let i = 1; i <= 3; i++) {
+      const t = i / 4;
+      ctx.beginPath();
+      ctx.moveTo(8 + t * 18, 12 + t * 62);
+      ctx.quadraticCurveTo(36 + t * 22, 30 + t * 46, 50 + t * 24, 44 + t * 40);
+      ctx.stroke();
+    }
+    // lit edge along the back of the curve
+    ctx.strokeStyle = steelLit;
+    ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.moveTo(2, 22);
-    ctx.quadraticCurveTo(14, 40, 28, 48);
+    ctx.moveTo(10, 14);
+    ctx.quadraticCurveTo(23, 55, 59, 89);
     ctx.stroke();
   }
 
   /* ---------- barrel (BEFORE the handguard) ---------- */
   if (A.form === "crossbow") {
-    ctx.strokeStyle = steel;
-    ctx.lineWidth = 7;
+    // A single continuous arc per limb. No straight run at all — the curve
+    // starts at the riser and keeps bending the whole way to the tip.
+    const riserX = BL * 0.56, tipY = 66;
+
+    ctx.lineCap = "round";
+    [-1, 1].forEach((side) => {
+      // one bezier from riser to tip, curving continuously
+      ctx.strokeStyle = steel;
+      ctx.lineWidth = 10;
+      ctx.beginPath();
+      ctx.moveTo(riserX, side * 4);
+      ctx.bezierCurveTo(
+        BL * 0.78, side * 8,      // leaves the riser almost flat
+        BL * 1.02, side * 30,     // bends hard through the middle
+        BL * 0.98, side * tipY    // and comes back in at the tip
+      );
+      ctx.stroke();
+
+      // thinner outer edge, following the same path for a tapered look
+      ctx.strokeStyle = steelLit;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(riserX + 2, side * 2);
+      ctx.bezierCurveTo(
+        BL * 0.78, side * 5,
+        BL * 1.0, side * 28,
+        BL * 0.965, side * (tipY - 3)
+      );
+      ctx.stroke();
+    });
+
+    // riser where the limbs meet the rail
+    ctx.fillStyle = steelDark;
     ctx.beginPath();
-    ctx.moveTo(BL * 0.72, -58);
-    ctx.quadraticCurveTo(BL * 0.92, -20, BL, 0);
-    ctx.quadraticCurveTo(BL * 0.92, 20, BL * 0.72, 58);
-    ctx.stroke();
-    ctx.strokeStyle = "#D8CDB4";
-    ctx.lineWidth = 1.6;
+    ctx.roundRect(riserX - 16, -13, 34, 26, 5);
+    ctx.fill();
+
+    // string to the nocks
+    ctx.strokeStyle = "#E4DCC6";
+    ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.moveTo(BL * 0.72, -58);
-    ctx.lineTo(60, 0);
-    ctx.lineTo(BL * 0.72, 58);
+    ctx.moveTo(BL * 0.98, -tipY);
+    ctx.lineTo(54, 0);
+    ctx.lineTo(BL * 0.98, tipY);
     ctx.stroke();
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(50, -7);
+    ctx.lineTo(50, 7);
+    ctx.stroke();
+
+    // Rail: stops at the riser instead of running past the limb tips.
     ctx.fillStyle = wood;
     ctx.beginPath();
-    ctx.roundRect(40, -6, BL - 40, 12, 3);
+    ctx.roundRect(28, -7, RAIL_LEN, 14, 4);
     ctx.fill();
+    ctx.fillStyle = woodLit;
+    ctx.fillRect(32, -6, RAIL_LEN - 8, 3);
+
+    // Bolt: shaft along the rail, FLETCHING at the back (near the string),
+    // BROADHEAD at the front. It was drawn with a solid red triangle at the
+    // rear, which read as an arrowhead aimed at the shooter.
+    const boltTip = 28 + RAIL_LEN + 16;
     ctx.strokeStyle = "#C9B591";
     ctx.lineWidth = 3;
     ctx.beginPath();
-    ctx.moveTo(70, 0);
-    ctx.lineTo(BL - 8, 0);
+    ctx.moveTo(52, 0);
+    ctx.lineTo(boltTip - 12, 0);
     ctx.stroke();
+
+    // broadhead, pointing away downrange
+    ctx.fillStyle = "#C7CDD2";
+    ctx.beginPath();
+    ctx.moveTo(boltTip, 0);
+    ctx.lineTo(boltTip - 14, -6);
+    ctx.lineTo(boltTip - 14, 6);
+    ctx.closePath();
+    ctx.fill();
+
+    // fletching — swept-back vanes at the nock end
+    ctx.fillStyle = "#8C3A2E";
+    ctx.beginPath();
+    ctx.moveTo(52, 0); ctx.lineTo(68, -6); ctx.lineTo(70, -1); ctx.lineTo(54, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(52, 0); ctx.lineTo(68, 6); ctx.lineTo(70, 1); ctx.lineTo(54, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.lineCap = "butt";
   } else {
     ctx.fillStyle = steel;
     ctx.beginPath();
@@ -1216,15 +1397,151 @@ function drawGun(ctx, s, reloadProgress, weapon, skin) {
   ctx.globalAlpha = 1;
 
   if (skin.camo) {
-    ctx.fillStyle = "#20281C";
-    ctx.globalAlpha = 0.55;
-    for (let i = 0; i < 9; i++) {
-      const bx = 40 + i * (BL / 9);
+    /* Camo containment, done by CONSTRUCTION rather than by clipping.
+
+       Clipping alone kept failing: a clip region is only as tight as the
+       path you give it, and every blob was still being GENERATED across a
+       loose rectangle, so anything the clip missed hung off the edge.
+
+       Now each part is described as a band — its top and bottom edge at any
+       point along its length — and blobs are placed inside that band with
+       their own radius subtracted from the room available. A blob therefore
+       cannot reach an edge, let alone cross it. The clip stays as a second
+       line of defence. */
+    const tones = Array.isArray(skin.camo) ? skin.camo : ["#2E3320", "#4A4A2C", "#7A6B42"];
+
+    // edges(t) -> [topY, bottomY] at position t (0 = back of part, 1 = front)
+    const paintBand = (buildPath, xA, xB, edges, seedBase) => {
+      ctx.save();
       ctx.beginPath();
-      ctx.ellipse(bx, ((i % 3) - 1) * 5, 13, 6, i * 0.7, 0, Math.PI * 2);
-      ctx.fill();
+      buildPath();
+      ctx.clip();
+
+      const len = Math.abs(xB - xA);
+      const blobs = Math.max(5, Math.round(len / 20));
+
+      for (let i = 0; i < blobs; i++) {
+        const seed = (i + seedBase) * 7919;
+        const t = (seed % 1000) / 1000;
+        const x = xA + (xB - xA) * t;
+        const [top, bot] = edges(t);
+        const room = bot - top;
+        if (room < 6) continue;
+
+        // radius can never exceed the room left, so a blob always fits
+        const ry = Math.min(room * 0.34, 3 + ((seed >> 7) % 5));
+        const rx = Math.min(len * 0.16, ry * (1.4 + ((seed >> 5) % 10) / 10));
+        const y = top + ry + (((seed >> 3) % 1000) / 1000) * (room - ry * 2);
+
+        ctx.fillStyle = tones[i % tones.length];
+        ctx.globalAlpha = 0.8;
+        ctx.beginPath();
+        ctx.moveTo(x - rx, y);
+        ctx.quadraticCurveTo(x - rx * 0.5, y - ry * 1.4, x + rx * 0.3, y - ry);
+        ctx.quadraticCurveTo(x + rx, y - ry * 0.4, x + rx * 0.8, y + ry * 0.6);
+        ctx.quadraticCurveTo(x + rx * 0.2, y + ry * 1.3, x - rx * 0.6, y + ry * 0.7);
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      // reed strokes, kept a couple of pixels inside the edges
+      ctx.globalAlpha = 0.45;
+      const reeds = Math.max(2, Math.round(len / 40));
+      for (let i = 0; i < reeds; i++) {
+        const seed = (i + seedBase) * 6151;
+        const t = (seed % 1000) / 1000;
+        const x = xA + (xB - xA) * t;
+        const [top, bot] = edges(t);
+        if (bot - top < 8) continue;
+        ctx.strokeStyle = tones[(i + 2) % tones.length];
+        ctx.lineWidth = 1.4 + ((seed >> 8) % 2);
+        ctx.beginPath();
+        ctx.moveTo(x, top + 2);
+        ctx.quadraticCurveTo(x + 2, (top + bot) / 2, x, bot - 2);
+        ctx.stroke();
+      }
+
+      // speckles
+      ctx.globalAlpha = 0.55;
+      ctx.fillStyle = tones[tones.length - 1];
+      const spots = Math.max(3, Math.round(len / 30));
+      for (let i = 0; i < spots; i++) {
+        const seed = (i + seedBase) * 4507;
+        const t = (seed % 1000) / 1000;
+        const x = xA + (xB - xA) * t;
+        const [top, bot] = edges(t);
+        if (bot - top < 8) continue;
+        const r = 1.4 + (seed % 2);
+        const y = top + r + (((seed >> 3) % 1000) / 1000) * (bot - top - r * 2);
+        ctx.beginPath();
+        ctx.ellipse(x, y, r, r * 0.8, seed, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    };
+
+    const lerp = (a, b, t) => a + (b - a) * t;
+
+    // --- barrel: a taper, so the band narrows toward the muzzle
+    if (A.form !== "crossbow") {
+      paintBand(
+        () => {
+          ctx.moveTo(46, -bore - 6);
+          ctx.lineTo(BL, -bore - 2);
+          ctx.lineTo(BL, bore + 2);
+          ctx.lineTo(46, bore + 6);
+          ctx.closePath();
+        },
+        48, BL - 2,
+        (t) => [lerp(-bore - 6, -bore - 2, t), lerp(bore + 6, bore + 2, t)],
+        1
+      );
     }
-    ctx.globalAlpha = 1;
+
+    // --- receiver
+    paintBand(() => ctx.rect(-46, -16, 96, 32), -44, 48, () => [-16, 16], 40);
+
+    // --- wooden / poly stock: a slanted band, dropping as it goes back
+    if (A.stock === "wood" || A.stock === "poly") {
+      paintBand(
+        () => {
+          ctx.moveTo(-40, -13);
+          ctx.quadraticCurveTo(-130, -20, -230, 6);
+          ctx.lineTo(-230, 34);
+          ctx.quadraticCurveTo(-120, 26, -40, 15);
+          ctx.closePath();
+        },
+        -44, -226,
+        // top edge runs -13 -> 6, bottom edge 15 -> 34, with a small inset
+        // for the bow in the curve
+        (t) => [lerp(-11, 8, t), lerp(13, 32, t)],
+        80
+      );
+    }
+
+    // --- AR buffer tube
+    if (A.stock === "tube") {
+      paintBand(() => ctx.rect(-150, -8, 116, 16), -148, -36, () => [-7, 7], 80);
+    }
+
+    // --- handguard / forend
+    if (A.forend) {
+      const fLen2 = Math.min(86, BL * 0.28);
+      const fx = 64 + slide;
+      paintBand(
+        () => ctx.rect(fx, -13, fLen2, 26),
+        fx + 2, fx + fLen2 - 2,
+        () => [-12, 12],
+        120
+      );
+    }
+
+    // --- crossbow rail
+    if (A.form === "crossbow") {
+      paintBand(() => ctx.rect(28, -7, RAIL_LEN, 14), 30, 26 + RAIL_LEN, () => [-6, 6], 160);
+    }
   }
 
   /* ---------- optics and sights ---------- */
@@ -2593,11 +2910,11 @@ function draw(ctx) {
     ctx.fillStyle = P.sun;
     ctx.globalAlpha = 0.9;
     ctx.beginPath();
-    ctx.arc(P.sunX, P.sunY, P.sunR, 0, Math.PI * 2);
+    ctx.arc(P.sunF * W, P.sunY, P.sunR, 0, Math.PI * 2);
     ctx.fill();
     ctx.globalAlpha = 0.16;
     ctx.beginPath();
-    ctx.arc(P.sunX, P.sunY, P.sunR * 2.1, 0, Math.PI * 2);
+    ctx.arc(P.sunF * W, P.sunY, P.sunR * 2.1, 0, Math.PI * 2);
     ctx.fill();
     ctx.globalAlpha = 1;
 
@@ -2950,8 +3267,8 @@ function draw(ctx) {
       const y = WATER_Y + 10 + i * 12;
       const w = 120 - i * 6;
       ctx.beginPath();
-      ctx.moveTo(P.sunX - w / 2 + Math.sin(s.t / 700 + i) * 12, y);
-      ctx.lineTo(P.sunX + w / 2 + Math.sin(s.t / 700 + i) * 12, y);
+      ctx.moveTo(P.sunF * W - w / 2 + Math.sin(s.t / 700 + i) * 12, y);
+      ctx.lineTo(P.sunF * W + w / 2 + Math.sin(s.t / 700 + i) * 12, y);
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
@@ -3477,6 +3794,7 @@ let SCREEN = "title";
 let SAVED = null;
 let CODE = "";
 let CODE_NOTE = "";
+let GRANT_NOTICE = 0;   // shells just restored, shown once on the brief screen
 
 const el = (tag, style, text) => {
   const n = document.createElement(tag);
@@ -3608,21 +3926,8 @@ function syncHud() {
 function startRound() {
   G = newRound(META);
   SCREEN = "playing";
-  render();                 // attaches the persistent canvas
-  initCanvasBitmap();       // size it and take a context
-
-  // Pre-render the static back bands once per round (bayou only).
-  const bg = document.createElement("canvas");
-  bg.width = W * DPR;
-  bg.height = H * DPR;
-  const bctx = bg.getContext("2d");
-  bctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-  if ((META.place ?? 0) === 0) {
-    drawBand(bctx, BANDS[0], 0, WATER_Y);
-    drawBand(bctx, BANDS[1], 0, WATER_Y);
-  }
-  BG = bg;
-
+  render();               // attaches the persistent canvas
+  initCanvasBitmap();     // sizes the world, the bitmap and the backdrop
   startLoop();
 }
 
@@ -3849,6 +4154,27 @@ function briefScreen() {
     META.hired.dog2 ? "2 dogs" : "1 dog",
     META.hired.hunter2 ? "+ hired gun" : null,
   ].filter(Boolean).join(" · ")));
+
+  if (GRANT_NOTICE) {
+    const box = el("div", {
+      border: "1px solid #6B5A1E", background: "rgba(201,162,39,0.10)",
+      borderRadius: "2px", padding: "12px 14px", marginBottom: "14px",
+    });
+    box.appendChild(el("div", {
+      fontFamily: MONO, fontSize: "12px", letterSpacing: "0.14em",
+      color: "#C9A227", marginBottom: "6px",
+    }, `◆ ${GRANT_NOTICE} GOLD SHELLS RESTORED`));
+    box.appendChild(el("div", {
+      fontSize: "13px", color: "#9DAEBC", lineHeight: "1.5",
+    }, GRANT.note));
+    const ok = el("button", {
+      ...btnStyle("ghost"), marginTop: "10px", padding: "9px 16px",
+      fontSize: "12px", minHeight: "40px",
+    }, "Thanks");
+    ok.onclick = () => { GRANT_NOTICE = 0; render(); };
+    box.appendChild(ok);
+    kids.push(box);
+  }
 
   kids.push(heading("ON THE WING"));
   DUCKS.forEach((d, i) => {
@@ -4233,7 +4559,6 @@ function makeCanvas() {
   const cv = el("canvas");
   Object.assign(cv.style, {
     display: "block",
-    aspectRatio: `${W} / ${H}`,
     margin: "0 auto",
     borderRadius: "3px",
     touchAction: "none", cursor: "crosshair", border: "1px solid #26374A",
@@ -4256,22 +4581,29 @@ function makeCanvas() {
   return cv;
 }
 
-/* Fit the canvas to whichever dimension runs out first. Using width alone
-   makes a landscape phone scroll to find the game; using both means it
-   always lands fully on screen. */
+/* Fit the canvas to the screen.
+
+   The world itself reshapes to the device (see setWorldWidth in the core),
+   so on a modern phone the aspect already matches and this ends up using
+   essentially the whole screen. Anything left over is a rounding remainder,
+   not a black bar. */
 function sizeCanvasToViewport(cv) {
   const vw = window.innerWidth || 900;
   const vh = window.innerHeight || 560;
-  const landscapePhone = vh <= 500 && vw > vh;
+  const landscapePhone = vh <= 560 && vw > vh;
 
-  // room left after padding and the header
-  const padX = landscapePhone ? 4 : isNarrow() ? 8 : 16;
-  const chromeY = landscapePhone ? 34 : isNarrow() ? 58 : 86;
+  const padX = landscapePhone ? 0 : isNarrow() ? 8 : 16;
+  const chromeY = landscapePhone ? 0 : isNarrow() ? 58 : 86;
 
-  const availW = Math.min(vw - padX * 2, 1400);
+  const availW = vw - padX * 2;
   const availH = vh - chromeY;
 
-  // pick the limiting dimension
+  // reshape the world to the space available, then fit inside it
+  if (landscapePhone || isNarrow()) {
+    const changed = setWorldWidth(worldWidthFor(availW, availH));
+    if (changed) BG = null;   // cached scenery was drawn at the old width
+  }
+
   let w = availW;
   let h = (w * H) / W;
   if (h > availH) {
@@ -4282,17 +4614,37 @@ function sizeCanvasToViewport(cv) {
   cv.style.width = Math.floor(w) + "px";
   cv.style.height = Math.floor(h) + "px";
   cv.style.maxWidth = "100%";
+  cv.style.border = landscapePhone ? "none" : "1px solid #26374A";
+  cv.style.borderRadius = landscapePhone ? "0" : "3px";
 }
 
 /* Size the bitmap and take a fresh context. Safe to call repeatedly. */
 function initCanvasBitmap() {
   if (!CANVAS) makeCanvas();
+  sizeCanvasToViewport(CANVAS);          // settles W before sizing the bitmap
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   DPR = dpr;
   CANVAS.width = W * dpr;
   CANVAS.height = H * dpr;
+  CANVAS.style.aspectRatio = W + " / " + H;
   CTX = CANVAS.getContext("2d");
   CTX.setTransform(dpr, 0, 0, dpr, 0, 0);
+  rebuildBackdrop();
+}
+
+/* The pre-rendered cypress bands are drawn at a specific width, so they have
+   to be redrawn whenever the world reshapes. */
+function rebuildBackdrop() {
+  const bg = document.createElement("canvas");
+  bg.width = W * DPR;
+  bg.height = H * DPR;
+  const bctx = bg.getContext("2d");
+  bctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if ((META.place ?? 0) === 0) {
+    drawBand(bctx, BANDS[0], 0, WATER_Y);
+    drawBand(bctx, BANDS[1], 0, WATER_Y);
+  }
+  BG = bg;
 }
 
 function playScreen() {
@@ -4407,19 +4759,44 @@ function transferPanel() {
   return box;
 }
 
+/* Restore a save into the live game.
+
+   This used to list fields by hand and silently dropped anything added
+   later — which is exactly how gold shells, guns and finishes vanished on
+   every load. It now starts from the sanitized save and only fills in what
+   is genuinely missing, so a field added to the game in future is carried
+   through without anyone having to remember to update this function. */
 function loadInto(d) {
   const m = newGame();
-  m.hunter = d.hunter || "Hunter";
-  m.dogName = d.dogName || "Scout";
-  m.money = d.money ?? 0;
-  m.round = d.round ?? 1;
-  m.best = d.best ?? 0;
-  m.ducks = Array.isArray(d.ducks) ? [...d.ducks] : [true, false, false];
-  m.places = Array.isArray(d.places) ? [...d.places] : [true, false, false];
-  m.place = d.place ?? 0;
-  m.hired = { dog2: false, hunter2: false, ...(d.hired || {}) };
-  m.lvl = { ...BLANK_LVL, ...(d.lvl || {}) };
+  const clean = (Save.sanitize ? Save.sanitize(d) : d) || {};
+
+  // copy everything the save has, then repair anything absent
+  for (const key of Object.keys(clean)) m[key] = clean[key];
+
+  m.hunter = m.hunter || "Hunter";
+  m.dogName = m.dogName || "Scout";
+  m.money = m.money ?? 0;
+  m.round = m.round ?? 1;
+  m.best = m.best ?? 0;
+  m.gb = m.gb ?? 0;
+  m.weapon = m.weapon || "pump";
+  m.skin = m.skin || "blued";
+  m.weapons = Array.isArray(m.weapons) && m.weapons.length ? m.weapons : ["pump"];
+  m.skins = Array.isArray(m.skins) && m.skins.length ? m.skins : ["blued"];
+  m.ducks = Array.isArray(m.ducks) ? m.ducks : DUCKS.map((dk, i) => i === 0 || !!dk.onlyAt);
+  m.places = Array.isArray(m.places) ? m.places : PLACES.map((_, i) => i === 0);
+  m.place = m.place ?? 0;
+  m.hired = { dog2: false, hunter2: false, ...(m.hired || {}) };
+  m.lvl = { ...BLANK_LVL, ...(m.lvl || {}) };
+
   META = m;
+
+  // one-time make-good for progress lost to the old save bug
+  const granted = applyGrant(META);
+  if (granted) {
+    GRANT_NOTICE = granted;
+    persist();
+  }
 }
 
 /* Landscape is a much bigger playing field on a phone — 16:10 in portrait
@@ -4437,7 +4814,10 @@ function orientationHint() {
 
 let resizeTimer = 0;
 function refit() {
-  if (CANVAS) sizeCanvasToViewport(CANVAS);
+  if (!CANVAS) { render(); return; }
+  const before = W;
+  sizeCanvasToViewport(CANVAS);
+  if (W !== before) initCanvasBitmap();   // world reshaped — new bitmap
   render();
 }
 window.addEventListener("resize", () => {
