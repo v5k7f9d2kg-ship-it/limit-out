@@ -391,25 +391,25 @@ const WEAPONS = [
     id: "ar15", name: "AR-15", cost: 0, gb: 45,
     shellMul: 1.9, reloadMul: 0.6, spreadMul: 0.45, pelletAdd: -1, valueMul: 1.15,
     blurb: "Huge magazine, quick reload — but a rifle throws no pattern.",
-    art: { barrel: 315, bore: 4, form: "rifle", stock: "tube", grip: true, forend: "rail", mag: "box", carrier: false, shield: false, optic: "scope", brake: true },
+    art: { barrel: 315, bore: 4, form: "rifle", stock: "tube", grip: true, forend: "rail", mag: "box", carrier: false, shield: false, optic: "scope", brake: true, lift: 50 },
   },
   {
     id: "ak47", name: "AK-47", cost: 0, gb: 55,
     shellMul: 1.7, reloadMul: 0.72, spreadMul: 0.55, pelletAdd: 1, valueMul: 1.1,
     blurb: "Heavier round. Fewer shells than the AR, but hits harder.",
-    art: { barrel: 232, bore: 5.5, form: "rifle", stock: "wood", grip: true, forend: "wood", mag: "curved", carrier: false, shield: false, optic: "post", brake: false },
+    art: { barrel: 232, bore: 5.5, form: "rifle", stock: "wood", grip: true, forend: "wood", mag: "curved", carrier: false, shield: false, optic: "post", brake: false, lift: 50 },
   },
   {
     id: "pistol", name: "Pistol", cost: 0, gb: 30,
     shellMul: 0.6, reloadMul: 0.5, spreadMul: 0.3, pelletAdd: -1, valueMul: 1.5,
     blurb: "Tiny pattern, few rounds. Pays well because it's hard.",
-    art: { barrel: 132, bore: 4.5, form: "pistol", stock: "none", grip: true, forend: null, mag: "box", carrier: false, shield: false, optic: "bead", brake: false },
+    art: { barrel: 132, bore: 4.5, form: "pistol", stock: "none", grip: true, forend: null, mag: "box", carrier: false, shield: false, optic: "bead", brake: false, lift: 120 },
   },
   {
     id: "crossbow", name: "Crossbow", cost: 0, gb: 80,
     shellMul: 0.35, reloadMul: 2.2, spreadMul: 0.18, pelletAdd: -2, valueMul: 2.6,
     blurb: "One bolt, slow to crank, no pattern at all. Pays like nothing else.",
-    art: { barrel: 250, bore: 4, form: "crossbow", stock: "wood", grip: true, forend: null, mag: "none", carrier: false, shield: false, optic: "scope", brake: false },
+    art: { barrel: 250, bore: 4, form: "crossbow", stock: "wood", grip: true, forend: null, mag: "none", carrier: false, shield: false, optic: "scope", brake: false, lift: 110 },
   },
 ];
 
@@ -1019,7 +1019,7 @@ function drawGun(ctx, s, reloadProgress, weapon, skin) {
   const A = weapon.art;
 
   ctx.save();
-  ctx.translate(GUN_PIVOT.x, GUN_PIVOT.y + dip * 34);
+  ctx.translate(GUN_PIVOT.x, GUN_PIVOT.y + dip * 34 - (A.lift || 0));
   ctx.rotate(gun.ang);
   ctx.scale(1, flip);
   ctx.rotate(kick * 0.14 + dip * 0.26);
@@ -1350,11 +1350,6 @@ function drawGun(ctx, s, reloadProgress, weapon, skin) {
 
   /* ---------- heat shield ---------- */
   if (A.shield) {
-    ctx.strokeStyle = steelLit;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.roundRect(168, -bore - 11, BL - 200, (bore + 11) * 2, 6);
-    ctx.stroke();
     ctx.fillStyle = steelDark;
     for (let i = 0; i < 6; i++) {
       const hx = 178 + i * ((BL - 220) / 6);
@@ -2416,8 +2411,9 @@ function fire(gx, gy) {
       const a = s.gun.ang;
       const fl = Math.cos(a) < 0 ? -1 : 1;
       const oy = -12 * fl;
+      const pivotY = GUN_PIVOT.y - (weaponOf(META).art.lift || 0);
       const rx = GUN_PIVOT.x + Math.cos(a) * 34 - Math.sin(a) * oy;
-      const ry = GUN_PIVOT.y + Math.sin(a) * 34 + Math.cos(a) * oy;
+      const ry = pivotY + Math.sin(a) * 34 + Math.cos(a) * oy;
       const eject = a - (Math.PI / 2) * fl;
       s.parts.push({
         x: rx, y: ry,
