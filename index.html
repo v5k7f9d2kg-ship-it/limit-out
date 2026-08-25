@@ -379,7 +379,7 @@ const WEAPONS = [
     id: "pump", name: "Pump Shotgun", cost: 0, gb: 0,
     shellMul: 1, reloadMul: 1, spreadMul: 1, pelletAdd: 0, valueMul: 1,
     blurb: "The one you started with. Wide pattern, forgiving.",
-    art: { barrel: 330, bore: 5, form: "shotgun", stock: "wood", grip: false, forend: "wood", mag: "tube", carrier: false, shield: false, optic: "bead", brake: false },
+    art: { barrel: 330, bore: 5, form: "shotgun", stock: "wood", grip: false, forend: "wood", mag: "tube", carrier: false, shield: false, optic: "bead", brake: false, lift: 100 },
   },
   {
     id: "tactical", name: "Tactical Shotgun", cost: 0, gb: 18,
@@ -1144,10 +1144,14 @@ function drawGun(ctx, s, reloadProgress, weapon, skin) {
   ctx.fill();
   ctx.fillStyle = steelLit;
   ctx.fillRect(-44, -15, 92, 3);
-  ctx.fillStyle = "#0B0E11";
-  ctx.beginPath();
-  ctx.roundRect(-14, -14, 34, 11, 2);
-  ctx.fill();
+  // A crossbow has no chamber to eject a case from — leave that stretch
+  // of the receiver a flat, uncut stock instead of a firearm's port.
+  if (A.form !== "crossbow") {
+    ctx.fillStyle = "#0B0E11";
+    ctx.beginPath();
+    ctx.roundRect(-14, -14, 34, 11, 2);
+    ctx.fill();
+  }
 
   // Guard sits forward of the grip. It used to be centred at -20 with the
   // grip starting at -30, so the two overlapped and the grip covered the
@@ -2440,8 +2444,9 @@ function fire(gx, gy) {
     s.gun.recoil = 1;
     s.gun.muzzle = 130;
     // eject the spent shell out of the ejection port, not from a point
-    // hovering ahead of the receiver
-    {
+    // hovering ahead of the receiver — a crossbow has no chamber, so it
+    // has nothing to eject
+    if (weaponOf(META).art.form !== "crossbow") {
       const a = s.gun.ang;
       const fl = Math.cos(a) < 0 ? -1 : 1;
       const { x: rx, y: ry } = gunToWorld(s, weaponOf(META), EJECT_PORT.x, EJECT_PORT.y);
