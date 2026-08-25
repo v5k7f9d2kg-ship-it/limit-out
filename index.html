@@ -1007,6 +1007,39 @@ function shade(hex, amt) {
   return "#" + ch.map((v) => v.toString(16).padStart(2, "0")).join("");
 }
 
+// Centre of the ejection port cut into the receiver (see the "#0B0E11"
+// roundRect below) — the one true anchor for "where the chamber is",
+// shared by the gun art and anything (like the eject spark) that needs
+// to line up with it.
+const EJECT_PORT = { x: 3, y: -8.5 };
+
+// Maps a point in the gun's local drawing space to world/screen
+// coordinates, by replaying the exact same transform stack drawGun()
+// applies (translate, rotate, flip, recoil rotation, recoil slide).
+// Keeping this in lock-step with drawGun means anything anchored to a
+// local gun coordinate — like the eject spark below — stays glued to
+// the art even as it lifts, kicks, or flips.
+function gunToWorld(s, weapon, lx, ly) {
+  const gun = s.gun;
+  const kick = gun.recoil;
+  const dip = gun.dip;
+  const flip = Math.cos(gun.ang) < 0 ? -1 : 1;
+  const lift = weapon.art.lift || 0;
+
+  let x = lx - kick * 20, y = ly;                    // translate(-kick*20, 0)
+  const rot2 = kick * 0.14 + dip * 0.26;              // rotate(kick*.14 + dip*.26)
+  const x2 = x * Math.cos(rot2) - y * Math.sin(rot2);
+  const y2 = x * Math.sin(rot2) + y * Math.cos(rot2);
+  const y3 = y2 * flip;                               // scale(1, flip)
+  const ang = gun.ang;                                 // rotate(gun.ang)
+  const x4 = x2 * Math.cos(ang) - y3 * Math.sin(ang);
+  const y4 = x2 * Math.sin(ang) + y3 * Math.cos(ang);
+  return {
+    x: x4 + GUN_PIVOT.x,
+    y: y4 + GUN_PIVOT.y + dip * 34 - lift,             // translate(pivot)
+  };
+}
+
 /* The gun. Drawn from a per-weapon parts list so a tactical shotgun and a
    pump don't come out looking like the same object with a shorter barrel.
    Draw order matters: the barrel goes down BEFORE the handguard, or the
@@ -2406,14 +2439,12 @@ function fire(gx, gy) {
     Sound.shot();
     s.gun.recoil = 1;
     s.gun.muzzle = 130;
-    // eject the spent shell from the receiver
+    // eject the spent shell out of the ejection port, not from a point
+    // hovering ahead of the receiver
     {
       const a = s.gun.ang;
       const fl = Math.cos(a) < 0 ? -1 : 1;
-      const oy = -12 * fl;
-      const pivotY = GUN_PIVOT.y - (weaponOf(META).art.lift || 0);
-      const rx = GUN_PIVOT.x + Math.cos(a) * 34 - Math.sin(a) * oy;
-      const ry = pivotY + Math.sin(a) * 34 + Math.cos(a) * oy;
+      const { x: rx, y: ry } = gunToWorld(s, weaponOf(META), EJECT_PORT.x, EJECT_PORT.y);
       const eject = a - (Math.PI / 2) * fl;
       s.parts.push({
         x: rx, y: ry,
