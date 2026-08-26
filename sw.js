@@ -7,7 +7,7 @@
    Bump CACHE when you deploy a new build, or phones will keep serving the
    old one from cache. That's the single most common PWA mistake. */
 
-const CACHE = "limit-out-v10";
+const CACHE = "limit-out-v11";
 
 const FILES = [
   "./",
@@ -34,9 +34,15 @@ self.addEventListener("activate", (e) => {
 });
 
 /* Network first, cache as the fallback. That way a redeploy reaches players
-   as soon as they have signal, while offline still works. */
+   as soon as they have signal, while offline still works.
+
+   Cross-origin requests (PostHog analytics) are left alone entirely — we
+   only want to cache-and-serve our own game files, not proxy or cache
+   third-party calls, and analytics failing offline should just fail
+   quietly rather than get handed a fallback page. */
 self.addEventListener("fetch", (e) => {
   if (e.request.method !== "GET") return;
+  if (new URL(e.request.url).origin !== self.location.origin) return;
   e.respondWith(
     fetch(e.request)
       .then((res) => {
