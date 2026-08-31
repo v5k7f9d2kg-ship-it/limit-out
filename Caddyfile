@@ -1,0 +1,59 @@
+{
+	admin off
+	persist_config off
+	auto_https off
+
+	log {
+		format json
+	}
+
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+# This overrides Railway/Railpack's default Caddyfile for static sites.
+# The default one ships a permissive baseline CSP (script-src/connect-src
+# allow any https: origin) meant to work for arbitrary static sites. Ours
+# replaces it with the tight policy this game actually needs, and adds
+# frame-ancestors / HSTS, which can only be set via a real HTTP header —
+# the <meta http-equiv="Content-Security-Policy"> tag in index.html is
+# silently ignored for those two directives by every browser.
+
+:{$PORT:80} {
+	log {
+		format json
+	}
+
+	respond /health 200
+
+	header {
+		X-XSS-Protection "1; mode=block"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "DENY"
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), usb=()"
+		Content-Security-Policy "default-src 'none'; script-src 'unsafe-inline' https://us-assets.i.posthog.com; style-src 'unsafe-inline'; img-src 'self' data:; manifest-src 'self'; connect-src 'self' https://us.i.posthog.com https://us-assets.i.posthog.com; worker-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+		-Server
+	}
+
+	root * .
+
+	file_server {
+		hide .git
+		hide .env*
+	}
+
+	encode {
+		gzip
+		zstd
+	}
+
+	try_files {path} {path}.html {path}/index.html
+
+	handle_errors {
+		rewrite * /{err.status_code}.html
+		file_server
+	}
+}
